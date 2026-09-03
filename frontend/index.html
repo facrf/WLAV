@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="pt-BR">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="light dark" />
+    <meta name="description" content="Arquivo local de conversas do WhatsApp" />
+    <title>WLAV — Arquivo do WhatsApp</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar" id="sidebar" aria-label="Conversas">
+        <header class="sidebar-header">
+          <div class="brand">
+            <div class="brand-mark" aria-hidden="true">W</div>
+            <div>
+              <strong>WLAV</strong>
+              <span>Arquivo local</span>
+            </div>
+          </div>
+          <button class="icon-button" id="themeButton" type="button" aria-label="Alternar tema">
+            <span id="themeIcon">☾</span>
+          </button>
+        </header>
+
+        <div class="search-wrap">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m21 21-4.35-4.35m2.35-5.65a8 8 0 1 1-16 0 8 8 0 0 1 16 0Z" /></svg>
+          <input id="searchInput" type="search" placeholder="Buscar mensagens ou conversas" autocomplete="off" />
+          <kbd>⌘ K</kbd>
+        </div>
+
+        <nav class="filters" aria-label="Filtrar conversas">
+          <button class="filter active" type="button" data-filter="all">Todos</button>
+          <button class="filter" type="button" data-filter="groups">Grupos</button>
+          <button class="filter" type="button" data-filter="clients">Clientes</button>
+        </nav>
+
+        <div class="list-heading">
+          <span id="listTitle">Conversas</span>
+          <span id="listCount"></span>
+        </div>
+        <div class="chat-list" id="chatList" role="list"></div>
+        <div class="sidebar-status" id="sidebarStatus" hidden></div>
+      </aside>
+
+      <main class="conversation" id="conversation">
+        <section class="empty-state" id="emptyState">
+          <div class="empty-illustration" aria-hidden="true">
+            <span>⌕</span>
+          </div>
+          <h1>Seu histórico, sempre acessível</h1>
+          <p>Escolha uma conversa ou procure em todo o arquivo. Os dados permanecem nesta rede.</p>
+          <div class="privacy-chip"><span></span> Arquivo local e privado</div>
+        </section>
+
+        <section class="chat-view" id="chatView" hidden>
+          <header class="chat-header">
+            <button class="icon-button mobile-back" id="backButton" type="button" aria-label="Voltar às conversas">‹</button>
+            <div class="avatar" id="activeAvatar"></div>
+            <div class="chat-heading">
+              <h1 id="activeChatName"></h1>
+              <p id="activeChatMeta"></p>
+            </div>
+            <button class="icon-button" id="jumpBottomButton" type="button" title="Ir para o fim" aria-label="Ir para mensagens mais recentes">↓</button>
+          </header>
+          <div class="messages" id="messages" aria-live="polite">
+            <div class="history-loader" id="historyLoader" hidden>Carregando mensagens antigas…</div>
+            <div id="messageList"></div>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <dialog class="lightbox" id="lightbox">
+      <button class="lightbox-close" id="lightboxClose" type="button" aria-label="Fechar">×</button>
+      <img id="lightboxImage" alt="Visualização ampliada" />
+      <p id="lightboxCaption"></p>
+    </dialog>
+
+    <div class="toast" id="toast" role="status" hidden></div>
+    <script src="/app.js" defer></script>
+  </body>
+</html>
+
