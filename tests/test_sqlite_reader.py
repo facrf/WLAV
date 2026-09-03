@@ -1,7 +1,7 @@
 import sqlite3
 from datetime import UTC
 
-from ingestor.sqlite_reader import MsgstoreReader, normalize_timestamp
+from ingestor.sqlite_reader import MsgstoreReader, normalize_ios_timestamp, normalize_timestamp
 
 
 def test_normalize_timestamp_accepts_common_epoch_precisions():
@@ -10,6 +10,7 @@ def test_normalize_timestamp_accepts_common_epoch_precisions():
     assert expected.tzinfo is UTC
     assert normalize_timestamp(1_700_000_000_000) == expected
     assert normalize_timestamp(1_700_000_000_000_000) == expected
+    assert normalize_ios_timestamp(721_692_800) == expected
 
 
 def test_reads_legacy_android_schema(tmp_path):
@@ -105,3 +106,61 @@ def test_reads_modern_android_schema(tmp_path):
     assert messages[0].content == "Uma foto"
     assert messages[0].media_type == "image"
     assert messages[0].quoted_message_id == "OLD-1"
+
+
+def test_reads_ios_chatstorage_schema(tmp_path):
+    database = tmp_path / "ChatStorage.sqlite"
+    connection = sqlite3.connect(database)
+    connection.executescript(
+        """
+        CREATE TABLE ZWACHATSESSION (
+            Z_PK INTEGER PRIMARY KEY,
+            ZCONTACTJID TEXT,
+            ZPARTNERNAME TEXT,
+            ZCREATIONDATE REAL,
+            ZLASTMESSAGEDATE REAL
+        );
+        CREATE TABLE ZWAMESSAGE (
+            Z_PK INTEGER PRIMARY KEY,
+            ZCHATSESSION INTEGER,
+            ZSTANZAID TEXT,
+            ZFROMJID TEXT,
+            ZISFROMME INTEGER,
+            ZMESSAGEDATE REAL,
+            ZTEXT TEXT,
+            ZMESSAGETYPE INTEGER,
+            ZMEDIAITEM INTEGER,
+            ZPARENTMESSAGE INTEGER
+        );
+        CREATE TABLE ZWAMEDIAITEM (
+            Z_PK INTEGER PRIMARY KEY,
+            ZMESSAGE INTEGER,
+            ZMEDIALOCALPATH TEXT,
+            ZCONTENTTYPE TEXT,
+            ZMEDIACAPTION TEXT
+        );
+        INSERT INTO ZWACHATSESSION VALUES (
+            1, '1200777@g.us', 'Grupo iPhone', 721692000, 721692800
+        );
+        INSERT INTO ZWAMESSAGE VALUES (
+            10, 1, 'IOS-1', '5511999@s.whatsapp.net', 0,
+            721692800, NULL, 1, 20, NULL
+        );
+        INSERT INTO ZWAMEDIAITEM VALUES (
+            20, 10, 'Media/photo.jpg', 'image/jpeg', 'Foto do iPhone'
+        );
+        """
+    )
+    connection.close()
+
+    with MsgstoreReader(database) as reader:
+        chats = reader.chats()
+        messages = list(reader.iter_messages())
+
+    assert reader.schema == "ios"
+    assert chats[0].name == "Grupo iPhone"
+    assert chats[0].is_group
+    assert messages[0].id == "IOS-1"
+    assert messages[0].content == "Foto do iPhone"
+    assert messages[0].media_reference == "Media/photo.jpg"
+    assert messages[0].timestamp == normalize_timestamp(1_700_000_000)

@@ -10,7 +10,11 @@ readme = "README.md"
 requires-python = ">=3.12"
 license = { text = "MIT" }
 dependencies = [
+  "alembic>=1.16,<2",
+  "cryptography>=45,<47",
   "fastapi>=0.116,<1",
+  "imageio-ffmpeg>=0.6,<1",
+  "Pillow>=11.3,<13",
   "uvicorn[standard]>=0.35,<1",
   "SQLAlchemy>=2.0.43,<3",
   "psycopg[binary]>=3.2.9,<4",

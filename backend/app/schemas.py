@@ -38,6 +38,7 @@ class MessageOut(BaseModel):
     quoted_message_id: str | None
     quoted_message: QuoteOut | None = None
     media_url: str | None = None
+    thumbnail_url: str | None = None
 
 
 class MessagePage(BaseModel):
@@ -58,3 +59,21 @@ class SearchPage(BaseModel):
     items: list[SearchResult]
     page: int
     has_more: bool
+
+
+class ImportJobOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    filename: str
+    source_sha256: str | None
+    status: str
+    source_schema: str | None
+    chats_processed: int
+    messages_processed: int
+    media_copied: int
+    media_missing: int
+    error: str | None
+    created_at: datetime
+    started_at: datetime | None
+    completed_at: datetime | None

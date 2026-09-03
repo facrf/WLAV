@@ -34,11 +34,16 @@ services:
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       API_PAGE_SIZE: ${API_PAGE_SIZE:-50}
       API_MAX_PAGE_SIZE: ${API_MAX_PAGE_SIZE:-200}
+      IMPORT_ROOT: /var/wlav_imports
+      TMPDIR: /var/wlav_imports
+      UPLOAD_MAX_GB: ${UPLOAD_MAX_GB:-100}
+      THUMBNAIL_MAX_SIZE: ${THUMBNAIL_MAX_SIZE:-480}
       TZ: America/Sao_Paulo
     ports:
-      - "${WLAV_PORT:-21001}:21001"
+      - "${WLAV_BIND_ADDRESS:-0.0.0.0}:${WLAV_PORT:-21001}:21001"
     volumes:
-      - whatsapp_media:/var/whatsapp_media:ro
+      - whatsapp_media:/var/whatsapp_media
+      - import_spool:/var/wlav_imports
     read_only: true
     tmpfs:
       - /tmp:size=64m
@@ -64,7 +69,7 @@ services:
       dockerfile: docker/app.Dockerfile
     profiles: ["tools"]
     depends_on:
-      db:
+      app:
         condition: service_healthy
     environment:
       DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://wlav:wlav-local-only@db:5432/wlav}
@@ -77,6 +82,41 @@ services:
       - whatsapp_media:/var/whatsapp_media
       - ./imports:/imports:ro
       - ./exports:/exports
+      - ./secrets:/run/secrets:ro
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - internal
+
+  backup:
+    build:
+      context: .
+      dockerfile: docker/app.Dockerfile
+    profiles: ["backup"]
+    restart: unless-stopped
+    depends_on:
+      app:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://wlav:wlav-local-only@db:5432/wlav}
+      MEDIA_ROOT: /var/whatsapp_media
+      WLAV_BACKUP_PASSWORD_FILE: /run/secrets/backup-password.txt
+      TZ: America/Sao_Paulo
+    entrypoint: ["python", "-m", "ingestor.main"]
+    command:
+      - backup-loop
+      - --output-dir
+      - /exports
+      - --interval-hours
+      - "${BACKUP_INTERVAL_HOURS:-24}"
+      - --retention-days
+      - "${BACKUP_RETENTION_DAYS:-30}"
+      - --encrypt
+    user: "${WLAV_UID:-1000}:${WLAV_GID:-1000}"
+    volumes:
+      - whatsapp_media:/var/whatsapp_media:ro
+      - ./exports:/exports
+      - ./secrets:/run/secrets:ro
     security_opt:
       - no-new-privileges:true
     networks:
@@ -85,6 +125,7 @@ services:
 volumes:
   postgres_data:
   whatsapp_media:
+  import_spool:
 
 networks:
   internal:

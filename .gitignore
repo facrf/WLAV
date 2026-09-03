@@ -18,8 +18,10 @@ imports/*
 !imports/.gitkeep
 exports/*
 !exports/.gitkeep
+secrets/*
+!secrets/.gitkeep
 media_data/
 *.db
 *.sqlite*
 *.tar.gz
-
+*.wlavenc

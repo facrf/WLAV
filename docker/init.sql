@@ -38,3 +38,21 @@ CREATE INDEX IF NOT EXISTS ix_chats_name_trgm
     ON chats
     USING GIN (name gin_trgm_ops);
 
+CREATE TABLE IF NOT EXISTS import_jobs (
+    id VARCHAR(36) PRIMARY KEY,
+    filename TEXT NOT NULL,
+    source_sha256 VARCHAR(64),
+    status VARCHAR(20) NOT NULL DEFAULT 'queued',
+    source_schema VARCHAR(30),
+    chats_processed BIGINT NOT NULL DEFAULT 0,
+    messages_processed BIGINT NOT NULL DEFAULT 0,
+    media_copied BIGINT NOT NULL DEFAULT 0,
+    media_missing BIGINT NOT NULL DEFAULT 0,
+    error TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    started_at TIMESTAMPTZ,
+    completed_at TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS ix_import_jobs_created_at_desc
+    ON import_jobs (created_at DESC);

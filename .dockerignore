@@ -11,9 +11,10 @@ __pycache__
 htmlcov
 imports
 exports
+secrets
 media_data
 *.db
 *.sqlite*
 *.tar.gz
+*.wlavenc
 tests
-

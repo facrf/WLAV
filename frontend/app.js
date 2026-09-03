@@ -10,6 +10,7 @@ const state = {
   loadedMessageIds: new Set(),
   searchTimer: null,
   searchRequest: 0,
+  importPoll: null,
 };
 
 const elements = {
@@ -36,6 +37,18 @@ const elements = {
   lightboxCaption: document.querySelector("#lightboxCaption"),
   lightboxClose: document.querySelector("#lightboxClose"),
   toast: document.querySelector("#toast"),
+  importButton: document.querySelector("#importButton"),
+  importDialog: document.querySelector("#importDialog"),
+  importClose: document.querySelector("#importClose"),
+  importForm: document.querySelector("#importForm"),
+  backupFile: document.querySelector("#backupFile"),
+  selectedFile: document.querySelector("#selectedFile"),
+  importSubmit: document.querySelector("#importSubmit"),
+  importProgress: document.querySelector("#importProgress"),
+  progressTitle: document.querySelector("#progressTitle"),
+  progressDetail: document.querySelector("#progressDetail"),
+  progressBar: document.querySelector("#progressBar"),
+  importHistory: document.querySelector("#importHistory"),
 };
 
 function initials(name) {
@@ -222,7 +235,8 @@ function createMedia(message) {
   wrapper.className = "message-media";
   if (message.media_type === "image" || message.media_type === "sticker") {
     const image = document.createElement("img");
-    image.src = message.media_url;
+    image.src = message.thumbnail_url || message.media_url;
+    if (message.thumbnail_url) image.addEventListener("error", () => { image.src = message.media_url; }, { once: true });
     image.alt = message.content || (message.media_type === "sticker" ? "Figurinha" : "Imagem");
     image.loading = "lazy";
     image.addEventListener("click", () => {
@@ -234,6 +248,7 @@ function createMedia(message) {
   } else if (message.media_type === "video") {
     const video = document.createElement("video");
     video.src = message.media_url;
+    if (message.thumbnail_url) video.poster = message.thumbnail_url;
     video.controls = true;
     video.preload = "metadata";
     wrapper.append(video);
@@ -458,6 +473,100 @@ function applyTheme(theme) {
   localStorage.setItem("wlav-theme", theme);
 }
 
+const importStatusLabels = {
+  queued: "Na fila",
+  running: "Importando",
+  completed: "Concluída",
+  failed: "Falhou",
+};
+
+function renderImportHistory(jobs) {
+  elements.importHistory.replaceChildren();
+  if (!jobs.length) {
+    elements.importHistory.textContent = "Nenhuma importação registrada.";
+    return;
+  }
+  for (const job of jobs) {
+    const row = document.createElement("div");
+    row.className = "import-job";
+    const status = document.createElement("span");
+    status.className = `job-status ${job.status}`;
+    const copy = document.createElement("div");
+    const name = document.createElement("div");
+    name.className = "job-name";
+    name.textContent = job.filename;
+    const detail = document.createElement("div");
+    detail.className = "job-detail";
+    detail.textContent = `${importStatusLabels[job.status] || job.status} · ${job.messages_processed.toLocaleString("pt-BR")} mensagens · ${job.media_copied.toLocaleString("pt-BR")} mídias`;
+    copy.append(name, detail);
+    if (job.error) {
+      const error = document.createElement("div");
+      error.className = "job-detail job-error";
+      error.textContent = job.error;
+      copy.append(error);
+    }
+    row.append(status, copy);
+    elements.importHistory.append(row);
+  }
+}
+
+async function loadImportHistory() {
+  try {
+    renderImportHistory(await api("/api/imports?limit=10"));
+  } catch (error) {
+    elements.importHistory.textContent = error.message;
+  }
+}
+
+function uploadBackup(file) {
+  return new Promise((resolve, reject) => {
+    const request = new XMLHttpRequest();
+    request.open("POST", "/api/imports");
+    request.responseType = "json";
+    request.upload.addEventListener("progress", (event) => {
+      if (!event.lengthComputable) return;
+      const percentage = Math.round((event.loaded / event.total) * 100);
+      elements.progressBar.value = percentage;
+      elements.progressDetail.textContent = `${percentage}% enviado`;
+    });
+    request.addEventListener("load", () => {
+      if (request.status >= 200 && request.status < 300) resolve(request.response);
+      else reject(new Error(request.response?.detail || `Erro ${request.status}`));
+    });
+    request.addEventListener("error", () => reject(new Error("Falha de rede durante o upload")));
+    const body = new FormData();
+    body.append("file", file);
+    request.send(body);
+  });
+}
+
+async function pollImport(jobId) {
+  window.clearTimeout(state.importPoll);
+  try {
+    const job = await api(`/api/imports/${encodeURIComponent(jobId)}`);
+    elements.progressBar.removeAttribute("value");
+    elements.progressTitle.textContent = importStatusLabels[job.status] || job.status;
+    elements.progressDetail.textContent = `${job.messages_processed.toLocaleString("pt-BR")} mensagens · ${job.media_copied.toLocaleString("pt-BR")} mídias`;
+    await loadImportHistory();
+    if (job.status === "completed") {
+      elements.progressBar.value = 100;
+      elements.importSubmit.disabled = false;
+      toast("Backup importado com sucesso.");
+      await loadChats();
+      return;
+    }
+    if (job.status === "failed") {
+      elements.importSubmit.disabled = false;
+      toast(job.error || "A importação falhou.");
+      return;
+    }
+    state.importPoll = window.setTimeout(() => pollImport(jobId), 1500);
+  } catch (error) {
+    elements.importSubmit.disabled = false;
+    toast(error.message);
+  }
+}
+
 elements.searchInput.addEventListener("input", (event) => {
   window.clearTimeout(state.searchTimer);
   state.searchTimer = window.setTimeout(() => performSearch(event.target.value), 280);
@@ -480,6 +589,36 @@ elements.backButton.addEventListener("click", () => elements.shell.classList.rem
 elements.jumpBottomButton.addEventListener("click", () => { elements.messages.scrollTop = elements.messages.scrollHeight; });
 elements.lightboxClose.addEventListener("click", () => elements.lightbox.close());
 elements.lightbox.addEventListener("click", (event) => { if (event.target === elements.lightbox) elements.lightbox.close(); });
+elements.importButton.addEventListener("click", () => {
+  loadImportHistory();
+  elements.importDialog.showModal();
+});
+elements.importClose.addEventListener("click", () => elements.importDialog.close());
+elements.backupFile.addEventListener("change", () => {
+  const file = elements.backupFile.files[0];
+  elements.selectedFile.textContent = file ? `${file.name} · ${(file.size / 1024 / 1024).toLocaleString("pt-BR", { maximumFractionDigits: 1 })} MB` : "Nenhum arquivo selecionado";
+});
+elements.importForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const file = elements.backupFile.files[0];
+  if (!file) return;
+  elements.importSubmit.disabled = true;
+  elements.importProgress.hidden = false;
+  elements.progressBar.value = 0;
+  elements.progressTitle.textContent = "Enviando backup…";
+  elements.progressDetail.textContent = "0% enviado";
+  try {
+    const job = await uploadBackup(file);
+    elements.progressTitle.textContent = "Arquivo recebido; iniciando importação…";
+    elements.progressBar.removeAttribute("value");
+    pollImport(job.id);
+  } catch (error) {
+    elements.importSubmit.disabled = false;
+    elements.progressTitle.textContent = "Falha no envio";
+    elements.progressDetail.textContent = error.message;
+    toast(error.message);
+  }
+});
 document.addEventListener("keydown", (event) => {
   if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
     event.preventDefault();

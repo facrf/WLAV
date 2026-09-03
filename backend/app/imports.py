@@ -1,0 +1,97 @@
+import json
+import logging
+import shutil
+import tarfile
+from datetime import UTC, datetime
+from pathlib import Path
+
+from sqlalchemy.orm import Session
+
+from backend.app.config import get_settings
+from backend.app.database import SessionLocal, engine
+from backend.app.models import ImportJob
+from ingestor.archive import restore_archive
+from ingestor.service import ImportStats, ingest_sqlite
+from ingestor.upload import prepare_whatsapp_upload
+
+logger = logging.getLogger("wlav.imports")
+settings = get_settings()
+
+
+def _update_job(job_id: str, **values) -> None:
+    with SessionLocal() as session:
+        job = session.get(ImportJob, job_id)
+        if job is None:
+            return
+        for key, value in values.items():
+            setattr(job, key, value)
+        session.commit()
+
+
+def _progress(job_id: str, stats: ImportStats) -> None:
+    _update_job(
+        job_id,
+        source_schema=stats.schema,
+        chats_processed=stats.chats,
+        messages_processed=stats.messages,
+        media_copied=stats.media_copied,
+        media_missing=stats.media_missing,
+    )
+
+
+def _is_wlav_archive(path: Path) -> bool:
+    if not tarfile.is_tarfile(path):
+        return False
+    try:
+        with tarfile.open(path, "r:*") as archive:
+            manifest = archive.extractfile("manifest.json")
+            return bool(manifest and json.load(manifest).get("format") == "wlav-archive")
+    except (KeyError, json.JSONDecodeError, tarfile.TarError):
+        return False
+
+
+def run_import_job(job_id: str, upload_path: Path) -> None:
+    work_directory = upload_path.parent
+    _update_job(job_id, status="running", started_at=datetime.now(UTC), error=None)
+    try:
+        if _is_wlav_archive(upload_path):
+            with Session(engine) as session:
+                try:
+                    stats = restore_archive(session, settings.media_root, upload_path)
+                    session.commit()
+                except Exception:
+                    session.rollback()
+                    raise
+            _update_job(
+                job_id,
+                source_schema="wlav_archive",
+                chats_processed=stats["chats"],
+                messages_processed=stats["messages"],
+                media_copied=stats["media"],
+            )
+        else:
+            database, media_directory = prepare_whatsapp_upload(
+                upload_path,
+                work_directory / "extracted",
+                settings.upload_max_gb * 1024**3,
+            )
+            stats = ingest_sqlite(
+                database,
+                media_directory,
+                settings.media_root,
+                engine,
+                thumbnail_size=settings.thumbnail_max_size,
+                progress=lambda current: _progress(job_id, current),
+            )
+            _progress(job_id, stats)
+        _update_job(job_id, status="completed", completed_at=datetime.now(UTC))
+    except Exception as exc:
+        logger.exception("Falha na importação %s", job_id)
+        _update_job(
+            job_id,
+            status="failed",
+            error=str(exc)[:4_000],
+            completed_at=datetime.now(UTC),
+        )
+    finally:
+        shutil.rmtree(work_directory, ignore_errors=True)

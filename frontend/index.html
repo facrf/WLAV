@@ -19,6 +19,9 @@
               <span>Arquivo local</span>
             </div>
           </div>
+          <button class="icon-button" id="importButton" type="button" aria-label="Importar outro backup" title="Importar backup">
+            <span>↑</span>
+          </button>
           <button class="icon-button" id="themeButton" type="button" aria-label="Alternar tema">
             <span id="themeIcon">☾</span>
           </button>
@@ -78,8 +81,39 @@
       <p id="lightboxCaption"></p>
     </dialog>
 
+    <dialog class="import-dialog" id="importDialog">
+      <header class="dialog-header">
+        <div>
+          <h2>Importar backup</h2>
+          <p>Adicione backups novos quando quiser. Mensagens existentes não serão duplicadas.</p>
+        </div>
+        <button class="icon-button" id="importClose" type="button" aria-label="Fechar">×</button>
+      </header>
+      <form id="importForm">
+        <label class="upload-zone" for="backupFile">
+          <span class="upload-icon">⇧</span>
+          <strong>Escolha o arquivo do backup</strong>
+          <span>SQLite, ZIP, TAR ou TAR.GZ com até o limite configurado</span>
+          <input id="backupFile" name="file" type="file" accept=".db,.sqlite,.zip,.tar,.gz,.tgz" required />
+        </label>
+        <p class="selected-file" id="selectedFile">Nenhum arquivo selecionado</p>
+        <div class="local-warning">Sem autenticação: use esta função somente em sua rede local confiável.</div>
+        <button class="primary-button" id="importSubmit" type="submit">Enviar e importar</button>
+      </form>
+      <section class="import-progress" id="importProgress" hidden>
+        <div class="progress-copy">
+          <strong id="progressTitle">Enviando…</strong>
+          <span id="progressDetail"></span>
+        </div>
+        <progress id="progressBar" max="100"></progress>
+      </section>
+      <section class="import-history">
+        <h3>Importações recentes</h3>
+        <div id="importHistory"></div>
+      </section>
+    </dialog>
+
     <div class="toast" id="toast" role="status" hidden></div>
     <script src="/app.js" defer></script>
   </body>
 </html>
-

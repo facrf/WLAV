@@ -1,23 +1,46 @@
+import asyncio
 import base64
+import hashlib
 import json
 import logging
 import mimetypes
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated
 from urllib.parse import quote
+from uuid import uuid4
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Request
+from fastapi import (
+    BackgroundTasks,
+    Depends,
+    FastAPI,
+    File,
+    HTTPException,
+    Query,
+    Request,
+    UploadFile,
+)
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import and_, func, literal_column, or_, select, text
 from sqlalchemy.orm import Session
 
+from ingestor.thumbnails import thumbnail_relative
+
 from .config import get_settings
-from .database import engine, get_session
-from .models import Chat, Message
-from .schemas import ChatOut, MessageOut, MessagePage, QuoteOut, SearchPage, SearchResult
+from .database import SessionLocal, engine, get_session
+from .imports import run_import_job
+from .models import Chat, ImportJob, Message
+from .schemas import (
+    ChatOut,
+    ImportJobOut,
+    MessageOut,
+    MessagePage,
+    QuoteOut,
+    SearchPage,
+    SearchResult,
+)
 
 settings = get_settings()
 logging.basicConfig(
@@ -25,13 +48,37 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
 logger = logging.getLogger("wlav")
+running_imports: set[asyncio.Task] = set()
+
+
+def _resume_interrupted_imports() -> None:
+    with SessionLocal() as session:
+        jobs = list(
+            session.scalars(select(ImportJob).where(ImportJob.status.in_(("queued", "running"))))
+        )
+        for job in jobs:
+            upload_path = settings.import_root / job.id / "source.upload"
+            if not upload_path.is_file():
+                job.status = "failed"
+                job.error = "Arquivo temporário ausente após reinicialização"
+                job.completed_at = datetime.now(UTC)
+        session.commit()
+    for job in jobs:
+        upload_path = settings.import_root / job.id / "source.upload"
+        if not upload_path.is_file():
+            continue
+        task = asyncio.create_task(asyncio.to_thread(run_import_job, job.id, upload_path))
+        running_imports.add(task)
+        task.add_done_callback(running_imports.discard)
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     settings.media_root.mkdir(parents=True, exist_ok=True)
+    settings.import_root.mkdir(parents=True, exist_ok=True)
     with engine.connect() as connection:
         connection.execute(text("SELECT 1"))
+    _resume_interrupted_imports()
     logger.info("WLAV iniciado; mídias em %s", settings.media_root)
     yield
 
@@ -76,6 +123,11 @@ def _message_out(message: Message, quotes: dict[str, Message] | None = None) -> 
         **{column.name: getattr(message, column.name) for column in Message.__table__.columns},
         quoted_message=quote_out,
         media_url=f"/media/{quote(message.media_path, safe='/')}" if message.media_path else None,
+        thumbnail_url=(
+            f"/media/{quote(thumbnail_relative(message.media_path), safe='/')}"
+            if message.media_path and message.media_type in {"image", "sticker", "video"}
+            else None
+        ),
     )
 
 
@@ -249,6 +301,68 @@ def search_messages(
         page=page,
         has_more=has_more,
     )
+
+
+@app.get("/api/imports", response_model=list[ImportJobOut])
+def list_imports(
+    session: SessionDep,
+    limit: int = Query(default=20, ge=1, le=100),
+) -> list[ImportJob]:
+    return list(
+        session.scalars(select(ImportJob).order_by(ImportJob.created_at.desc()).limit(limit))
+    )
+
+
+@app.get("/api/imports/{job_id}", response_model=ImportJobOut)
+def get_import(job_id: str, session: SessionDep) -> ImportJob:
+    job = session.get(ImportJob, job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Importação não encontrada")
+    return job
+
+
+@app.post("/api/imports", response_model=ImportJobOut, status_code=202)
+async def create_import(
+    background_tasks: BackgroundTasks,
+    session: SessionDep,
+    file: Annotated[UploadFile, File(description="SQLite ou pacote ZIP/TAR/TAR.GZ")],
+) -> ImportJob:
+    job_id = str(uuid4())
+    job_directory = settings.import_root / job_id
+    job_directory.mkdir(parents=True, exist_ok=False)
+    upload_path = job_directory / "source.upload"
+    maximum = settings.upload_max_gb * 1024**3
+    size = 0
+    digest = hashlib.sha256()
+    try:
+        with upload_path.open("wb") as handle:
+            while chunk := await file.read(4 * 1024 * 1024):
+                size += len(chunk)
+                if size > maximum:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"Upload excede o limite de {settings.upload_max_gb} GB",
+                    )
+                digest.update(chunk)
+                handle.write(chunk)
+    except Exception:
+        upload_path.unlink(missing_ok=True)
+        job_directory.rmdir()
+        raise
+    finally:
+        await file.close()
+
+    job = ImportJob(
+        id=job_id,
+        filename=(file.filename or "backup")[:500],
+        source_sha256=digest.hexdigest(),
+        status="queued",
+    )
+    session.add(job)
+    session.commit()
+    session.refresh(job)
+    background_tasks.add_task(run_import_job, job_id, upload_path)
+    return job
 
 
 @app.get("/media/{filepath:path}")

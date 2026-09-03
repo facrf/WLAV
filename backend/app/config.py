@@ -12,12 +12,15 @@ class Settings(BaseSettings):
 
     database_url: str = "postgresql+psycopg://wlav:wlav@localhost:5432/wlav"
     media_root: Path = Path("/var/whatsapp_media")
+    import_root: Path = Path("/var/wlav_imports")
     frontend_root: Path = PROJECT_ROOT / "frontend"
     app_host: str = "0.0.0.0"
     app_port: int = 21001
     log_level: str = "INFO"
     api_page_size: int = Field(default=50, ge=10, le=200)
     api_max_page_size: int = Field(default=200, ge=50, le=500)
+    upload_max_gb: int = Field(default=100, ge=1, le=2_000)
+    thumbnail_max_size: int = Field(default=480, ge=160, le=1_920)
 
 
 @lru_cache

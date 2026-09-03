@@ -1,0 +1,103 @@
+import logging
+import subprocess
+from pathlib import Path
+
+from imageio_ffmpeg import get_ffmpeg_exe
+from PIL import Image, ImageOps, UnidentifiedImageError
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+from backend.app.models import Message
+
+logger = logging.getLogger("wlav.thumbnails")
+
+
+def thumbnail_relative(media_path: str) -> str:
+    source = Path(media_path)
+    return (source.parent / ".thumbs" / f"{source.name}.jpg").as_posix()
+
+
+class Thumbnailer:
+    def __init__(self, media_root: Path, max_size: int = 480):
+        self.media_root = media_root.resolve()
+        self.max_size = max_size
+
+    def generate(self, media_path: str, media_type: str | None) -> str | None:
+        if media_type not in {"image", "sticker", "video"}:
+            return None
+        source = (self.media_root / media_path).resolve()
+        if not source.is_relative_to(self.media_root) or not source.is_file():
+            return None
+        relative = thumbnail_relative(media_path)
+        destination = (self.media_root / relative).resolve()
+        if not destination.is_relative_to(self.media_root):
+            return None
+        if (
+            destination.is_file()
+            and destination.stat().st_size > 0
+            and destination.stat().st_mtime >= source.stat().st_mtime
+        ):
+            return relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        partial = destination.with_name(destination.name + ".part.jpg")
+        try:
+            if media_type in {"image", "sticker"}:
+                self._image(source, partial)
+            else:
+                self._video(source, partial)
+            partial.replace(destination)
+            return relative
+        except (OSError, subprocess.SubprocessError, UnidentifiedImageError) as exc:
+            logger.warning("Não foi possível gerar thumbnail de %s: %s", media_path, exc)
+            partial.unlink(missing_ok=True)
+            return None
+
+    def _image(self, source: Path, destination: Path) -> None:
+        with Image.open(source) as original:
+            image = ImageOps.exif_transpose(original)
+            if image.mode not in {"RGB", "L"}:
+                background = Image.new("RGB", image.size, "white")
+                if "A" in image.getbands():
+                    background.paste(image, mask=image.getchannel("A"))
+                else:
+                    background.paste(image)
+                image = background
+            elif image.mode == "L":
+                image = image.convert("RGB")
+            image.thumbnail((self.max_size, self.max_size), Image.Resampling.LANCZOS)
+            image.save(destination, "JPEG", quality=82, optimize=True)
+
+    def _video(self, source: Path, destination: Path) -> None:
+        command = [
+            get_ffmpeg_exe(),
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-ss",
+            "00:00:01",
+            "-i",
+            str(source),
+            "-frames:v",
+            "1",
+            "-vf",
+            f"thumbnail,scale={self.max_size}:-2:force_original_aspect_ratio=decrease",
+            str(destination),
+        ]
+        subprocess.run(command, check=True, timeout=120, capture_output=True)
+
+
+def rebuild_thumbnails(session: Session, thumbnailer: Thumbnailer) -> dict[str, int]:
+    stats = {"generated": 0, "skipped": 0}
+    messages = session.execute(
+        select(Message.media_path, Message.media_type).where(
+            Message.media_path.is_not(None),
+            Message.media_type.in_(("image", "sticker", "video")),
+        )
+    ).yield_per(500)
+    for media_path, media_type in messages:
+        if media_path and thumbnailer.generate(media_path, media_type):
+            stats["generated"] += 1
+        else:
+            stats["skipped"] += 1
+    return stats

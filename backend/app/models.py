@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Index, String, Text, func
+from sqlalchemy import BigInteger, Boolean, DateTime, ForeignKey, Index, String, Text, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .database import Base
@@ -42,7 +42,33 @@ class Message(Base):
 
     __table_args__ = (
         Index("ix_messages_chat_timestamp_desc", "chat_jid", timestamp.desc()),
-        Index("ix_messages_quoted_message_id", "quoted_message_id"),
+        Index(
+            "ix_messages_quoted_message_id",
+            "quoted_message_id",
+            postgresql_where=quoted_message_id.is_not(None),
+        ),
     )
 
     chat: Mapped[Chat] = relationship(back_populates="messages")
+
+
+class ImportJob(Base):
+    __tablename__ = "import_jobs"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    filename: Mapped[str] = mapped_column(Text, nullable=False)
+    source_sha256: Mapped[str | None] = mapped_column(String(64))
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="queued")
+    source_schema: Mapped[str | None] = mapped_column(String(30))
+    chats_processed: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    messages_processed: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    media_copied: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    media_missing: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    error: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (Index("ix_import_jobs_created_at_desc", created_at.desc()),)

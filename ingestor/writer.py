@@ -62,9 +62,9 @@ def upsert_messages(session: Session, rows: list[dict]) -> int:
             "timestamp": excluded.timestamp,
             "from_me": excluded.from_me,
             "has_media": excluded.has_media,
-            "media_type": excluded.media_type,
-            "media_path": excluded.media_path,
-            "media_mime": excluded.media_mime,
+            "media_type": func.coalesce(excluded.media_type, Message.media_type),
+            "media_path": func.coalesce(excluded.media_path, Message.media_path),
+            "media_mime": func.coalesce(excluded.media_mime, Message.media_mime),
             "quoted_message_id": excluded.quoted_message_id,
         },
     )

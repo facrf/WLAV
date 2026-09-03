@@ -1,3 +1,4 @@
+import hashlib
 import io
 import json
 import logging
@@ -11,9 +12,11 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from backend.app.models import Chat, Message
+from ingestor.thumbnails import thumbnail_relative
 from ingestor.writer import refresh_chat_bounds, upsert_chats, upsert_messages
 
 logger = logging.getLogger("wlav.archive")
+CHUNK_SIZE = 4 * 1024 * 1024
 
 
 def _json_default(value: Any) -> str:
@@ -33,11 +36,30 @@ def _add_bytes(archive: tarfile.TarFile, name: str, payload: bytes) -> None:
     archive.addfile(info, io.BytesIO(payload))
 
 
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(CHUNK_SIZE):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _sha256_member(archive: tarfile.TarFile, member: tarfile.TarInfo) -> str:
+    extracted = archive.extractfile(member)
+    if extracted is None:
+        raise ValueError(f"Não foi possível ler {member.name}")
+    digest = hashlib.sha256()
+    while chunk := extracted.read(CHUNK_SIZE):
+        digest.update(chunk)
+    return digest.hexdigest()
+
+
 def export_archive(session: Session, media_root: Path, output: Path) -> dict[str, int]:
     output = output.resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
     media_root = media_root.resolve()
-    stats = {"chats": 0, "messages": 0, "media": 0, "missing_media": 0}
+    stats = {"chats": 0, "messages": 0, "media": 0, "thumbnails": 0, "missing_media": 0}
+    checksums: dict[str, str] = {}
     added_media: set[str] = set()
 
     with tempfile.TemporaryDirectory(prefix="wlav-export-") as temporary:
@@ -60,40 +82,64 @@ def export_archive(session: Session, media_root: Path, output: Path) -> dict[str
                 )
                 stats["messages"] += 1
 
+        checksums["chats.jsonl"] = _sha256_file(chats_path)
+        checksums["messages.jsonl"] = _sha256_file(messages_path)
         partial = output.with_name(output.name + ".part")
-        with tarfile.open(partial, "w:gz", format=tarfile.PAX_FORMAT) as archive:
-            manifest = {
-                "format": "wlav-archive",
-                "version": 1,
-                "created_at": datetime.now().astimezone().isoformat(),
-            }
-            _add_bytes(
-                archive,
-                "manifest.json",
-                json.dumps(manifest, ensure_ascii=False, indent=2).encode(),
-            )
-            archive.add(chats_path, arcname="chats.jsonl", recursive=False)
-            archive.add(messages_path, arcname="messages.jsonl", recursive=False)
+        try:
+            with tarfile.open(partial, "w:gz", format=tarfile.PAX_FORMAT) as archive:
+                archive.add(chats_path, arcname="chats.jsonl", recursive=False)
+                archive.add(messages_path, arcname="messages.jsonl", recursive=False)
 
-            media_paths = session.scalars(
-                select(Message.media_path)
-                .where(Message.media_path.is_not(None))
-                .distinct()
-                .order_by(Message.media_path)
-            )
-            for relative_string in media_paths:
-                if not relative_string or relative_string in added_media:
-                    continue
-                relative = Path(relative_string)
-                source = (media_root / relative).resolve()
-                if not source.is_relative_to(media_root) or not source.is_file():
-                    stats["missing_media"] += 1
-                    logger.warning("Mídia ausente durante exportação: %s", relative_string)
-                    continue
-                archive.add(source, arcname=f"media/{relative.as_posix()}", recursive=False)
-                added_media.add(relative_string)
-                stats["media"] += 1
-        partial.replace(output)
+                media_paths = session.scalars(
+                    select(Message.media_path)
+                    .where(Message.media_path.is_not(None))
+                    .distinct()
+                    .order_by(Message.media_path)
+                )
+                for relative_string in media_paths:
+                    if not relative_string or relative_string in added_media:
+                        continue
+                    relative = Path(relative_string)
+                    source = (media_root / relative).resolve()
+                    if not source.is_relative_to(media_root) or not source.is_file():
+                        stats["missing_media"] += 1
+                        logger.warning("Mídia ausente durante exportação: %s", relative_string)
+                        continue
+                    archive_name = f"media/{relative.as_posix()}"
+                    archive.add(source, arcname=archive_name, recursive=False)
+                    checksums[archive_name] = _sha256_file(source)
+                    added_media.add(relative_string)
+                    stats["media"] += 1
+
+                    thumb_relative = thumbnail_relative(relative_string)
+                    thumbnail = (media_root / thumb_relative).resolve()
+                    if thumbnail.is_relative_to(media_root) and thumbnail.is_file():
+                        thumb_name = f"media/{thumb_relative}"
+                        archive.add(thumbnail, arcname=thumb_name, recursive=False)
+                        checksums[thumb_name] = _sha256_file(thumbnail)
+                        stats["thumbnails"] += 1
+
+                manifest = {
+                    "format": "wlav-archive",
+                    "version": 2,
+                    "created_at": datetime.now().astimezone().isoformat(),
+                    "stats": stats,
+                    "checksum": "sha256",
+                }
+                _add_bytes(
+                    archive,
+                    "checksums.json",
+                    json.dumps(checksums, sort_keys=True, indent=2).encode(),
+                )
+                _add_bytes(
+                    archive,
+                    "manifest.json",
+                    json.dumps(manifest, ensure_ascii=False, indent=2).encode(),
+                )
+            partial.replace(output)
+        except Exception:
+            partial.unlink(missing_ok=True)
+            raise
     return stats
 
 
@@ -110,6 +156,50 @@ def _validate_members(archive: tarfile.TarFile) -> dict[str, tarfile.TarInfo]:
     if not required.issubset(members):
         raise ValueError("Backup inválido: manifest.json/chats.jsonl/messages.jsonl ausentes")
     return members
+
+
+def _read_manifest(archive: tarfile.TarFile, members: dict[str, tarfile.TarInfo]) -> dict:
+    manifest_file = archive.extractfile(members["manifest.json"])
+    if manifest_file is None:
+        raise ValueError("Manifesto ilegível")
+    manifest = json.load(manifest_file)
+    if manifest.get("format") != "wlav-archive" or manifest.get("version") not in (1, 2):
+        raise ValueError("Formato ou versão de backup não suportado")
+    return manifest
+
+
+def verify_archive(source: Path) -> dict[str, int]:
+    source = source.resolve()
+    with tarfile.open(source, "r:gz") as archive:
+        members = _validate_members(archive)
+        manifest = _read_manifest(archive, members)
+        if manifest["version"] == 1:
+            return {"files": len(members), "bytes": sum(item.size for item in members.values())}
+        if "checksums.json" not in members:
+            raise ValueError("Backup versão 2 sem checksums.json")
+        checksum_file = archive.extractfile(members["checksums.json"])
+        if checksum_file is None:
+            raise ValueError("checksums.json ilegível")
+        expected = json.load(checksum_file)
+        data_members = {name for name, member in members.items() if member.isfile()} - {
+            "manifest.json",
+            "checksums.json",
+        }
+        if data_members != set(expected):
+            raise ValueError("A lista de arquivos não corresponde aos checksums do backup")
+    actual: dict[str, str] = {}
+    total_bytes = 0
+    # Segunda passagem sequencial: evita seeks quadráticos dentro do gzip.
+    with tarfile.open(source, "r:gz") as archive:
+        for member in archive:
+            if not member.isfile() or member.name in {"manifest.json", "checksums.json"}:
+                continue
+            actual[member.name] = _sha256_member(archive, member)
+            total_bytes += member.size
+    for name, expected_hash in expected.items():
+        if actual.get(name) != expected_hash:
+            raise ValueError(f"Falha de integridade em: {name}")
+    return {"files": len(expected), "bytes": total_bytes}
 
 
 def _json_lines(archive: tarfile.TarFile, member: tarfile.TarInfo):
@@ -137,15 +227,11 @@ def restore_archive(
 ) -> dict[str, int]:
     source = source.resolve()
     media_root = media_root.resolve()
+    verify_archive(source)
     stats = {"chats": 0, "messages": 0, "media": 0}
     with tarfile.open(source, "r:gz") as archive:
         members = _validate_members(archive)
-        manifest_file = archive.extractfile(members["manifest.json"])
-        if manifest_file is None:
-            raise ValueError("Manifesto ilegível")
-        manifest = json.load(manifest_file)
-        if manifest.get("format") != "wlav-archive" or manifest.get("version") != 1:
-            raise ValueError("Formato ou versão de backup não suportado")
+        _read_manifest(archive, members)
 
         chat_batch: list[dict[str, Any]] = []
         for row in _json_lines(archive, members["chats.jsonl"]):
@@ -165,7 +251,10 @@ def restore_archive(
         stats["messages"] += upsert_messages(session, message_batch)
         refresh_chat_bounds(session)
 
-        for name, member in members.items():
+    # A mídia também é extraída em ordem linear para escalar a arquivos grandes.
+    with tarfile.open(source, "r:gz") as archive:
+        for member in archive:
+            name = member.name
             if not name.startswith("media/") or not member.isfile():
                 continue
             relative = Path(PurePosixPath(name).relative_to("media"))
@@ -178,7 +267,7 @@ def restore_archive(
                 continue
             partial = destination.with_name(destination.name + ".part")
             with partial.open("wb") as handle:
-                while chunk := extracted.read(1024 * 1024):
+                while chunk := extracted.read(CHUNK_SIZE):
                     handle.write(chunk)
             partial.replace(destination)
             stats["media"] += 1

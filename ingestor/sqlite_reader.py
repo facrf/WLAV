@@ -18,6 +18,15 @@ MEDIA_TYPES = {
     20: "sticker",
 }
 
+IOS_MEDIA_TYPES = {
+    1: "image",
+    2: "video",
+    3: "audio",
+    8: "document",
+    15: "sticker",
+}
+APPLE_EPOCH_OFFSET = 978_307_200
+
 
 @dataclass(slots=True)
 class ChatRecord:
@@ -65,6 +74,19 @@ def normalize_timestamp(value: Any) -> datetime | None:
         return None
 
 
+def normalize_ios_timestamp(value: Any) -> datetime | None:
+    """Converte NSDate (época 2001) ou Unix epoch para UTC."""
+    if value in (None, ""):
+        return None
+    try:
+        numeric = float(value)
+        if -APPLE_EPOCH_OFFSET < numeric < 1_200_000_000:
+            numeric += APPLE_EPOCH_OFFSET
+        return normalize_timestamp(numeric)
+    except (TypeError, ValueError):
+        return None
+
+
 def bounded_id(value: Any, prefix: str = "") -> str:
     raw = f"{prefix}{value}"
     if len(raw) <= 100:
@@ -74,7 +96,7 @@ def bounded_id(value: Any, prefix: str = "") -> str:
 
 
 class MsgstoreReader:
-    """Leitor somente-leitura para schemas Android moderno e legado."""
+    """Leitor somente-leitura para schemas Android e WhatsApp iOS."""
 
     def __init__(self, sqlite_path: Path):
         self.sqlite_path = sqlite_path.resolve()
@@ -93,6 +115,8 @@ class MsgstoreReader:
             self.schema = "modern"
         elif "messages" in self.tables:
             self.schema = "legacy"
+        elif {"ZWAMESSAGE", "ZWACHATSESSION"}.issubset(self.tables):
+            self.schema = "ios"
         else:
             preview = ", ".join(sorted(self.tables)[:20])
             raise UnsupportedSchemaError(
@@ -146,8 +170,24 @@ class MsgstoreReader:
                 jid = self._jid_from_row(row)
                 if jid:
                     self._jids[row["_id"]] = jid
+        elif self.schema == "ios" and "ZWAJID" in self.tables:
+            for row in self.connection.execute('SELECT * FROM "ZWAJID"'):
+                primary_key = self._first_value(row, "Z_PK", "Z_ENT")
+                jid = self._first_value(row, "ZRAWSTRING", "ZJID", "ZSTRING")
+                if primary_key is not None and jid:
+                    self._jids[primary_key] = str(jid)
         self._load_contacts()
         self._load_chats()
+
+    @staticmethod
+    def _first_value(row: sqlite3.Row, *names: str) -> Any:
+        keys = set(row.keys())
+        return next((row[name] for name in names if name in keys and row[name] is not None), None)
+
+    def _ios_jid(self, value: Any) -> str | None:
+        if value is None:
+            return None
+        return self._jids.get(value) or str(value)
 
     def _load_contacts(self) -> None:
         for table in ("wa_contacts", "wa_vnames"):
@@ -173,6 +213,30 @@ class MsgstoreReader:
                 name = next((str(row[key]) for key in name_columns if row[key]), None)
                 if jid and name:
                     self._contacts.setdefault(jid, name)
+        if self.schema == "ios":
+            self._load_ios_contacts()
+
+    def _load_ios_contacts(self) -> None:
+        for table in ("ZWACONTACT", "ZWAPROFILEPUSHNAME"):
+            if table not in self.tables:
+                continue
+            for row in self.connection.execute(f'SELECT * FROM "{table}"'):
+                jid_value = self._first_value(
+                    row, "ZJID", "ZCONTACTJID", "ZWHATSAPPID", "ZPUSHNAMEJID"
+                )
+                jid = self._ios_jid(jid_value)
+                name = self._first_value(
+                    row,
+                    "ZFULLNAME",
+                    "ZDISPLAYNAME",
+                    "ZPUSHNAME",
+                    "ZGIVENNAME",
+                    "ZNICKNAME",
+                )
+                if jid and "@" not in jid:
+                    jid = f"{jid}@s.whatsapp.net"
+                if jid and name:
+                    self._contacts.setdefault(jid, str(name))
 
     @staticmethod
     def _fallback_name(jid: str) -> str:
@@ -206,7 +270,7 @@ class MsgstoreReader:
                     created_at=normalize_timestamp(created_raw),
                     last_message_time=normalize_timestamp(last_raw),
                 )
-        else:
+        elif self.schema == "legacy":
             table = "chat_list" if "chat_list" in self.tables else None
             if not table:
                 return
@@ -238,6 +302,29 @@ class MsgstoreReader:
                     created_at=normalize_timestamp(created_raw),
                     last_message_time=normalize_timestamp(last_raw),
                 )
+        else:
+            self._load_ios_chats()
+
+    def _load_ios_chats(self) -> None:
+        for row in self.connection.execute('SELECT * FROM "ZWACHATSESSION"'):
+            primary_key = self._first_value(row, "Z_PK")
+            jid = self._ios_jid(self._first_value(row, "ZCONTACTJID", "ZJID", "ZPARTNERJID"))
+            if primary_key is None or not jid:
+                continue
+            name = self._first_value(row, "ZPARTNERNAME", "ZSUBJECT", "ZDISPLAYNAME")
+            created = normalize_ios_timestamp(
+                self._first_value(row, "ZCREATIONDATE", "ZCREATEDDATE")
+            )
+            last = normalize_ios_timestamp(
+                self._first_value(row, "ZLASTMESSAGEDATE", "ZMESSAGEDATE")
+            )
+            self._chats[primary_key] = ChatRecord(
+                jid=bounded_id(jid),
+                name=str(name) if name else self._contacts.get(jid) or self._fallback_name(jid),
+                is_group=jid.endswith("@g.us"),
+                created_at=created or last,
+                last_message_time=last,
+            )
 
     def chats(self) -> list[ChatRecord]:
         return list(self._chats.values())
@@ -245,8 +332,10 @@ class MsgstoreReader:
     def iter_messages(self, batch_size: int = 2_000) -> Iterator[MessageRecord]:
         if self.schema == "modern":
             yield from self._iter_modern_messages(batch_size)
-        else:
+        elif self.schema == "legacy":
             yield from self._iter_legacy_messages(batch_size)
+        else:
+            yield from self._iter_ios_messages(batch_size)
 
     def _iter_modern_messages(self, batch_size: int) -> Iterator[MessageRecord]:
         columns = self.columns("message")
@@ -401,5 +490,116 @@ class MsgstoreReader:
                     media_mime=str(row["media_mime"]) if row["media_mime"] else None,
                     quoted_message_id=(
                         bounded_id(row["quoted_message_id"]) if row["quoted_message_id"] else None
+                    ),
+                )
+
+    def _iter_ios_messages(self, batch_size: int) -> Iterator[MessageRecord]:
+        message_columns = self.columns("ZWAMESSAGE")
+        media_by_id: dict[Any, sqlite3.Row] = {}
+        media_by_message: dict[Any, sqlite3.Row] = {}
+        if "ZWAMEDIAITEM" in self.tables:
+            for media in self.connection.execute('SELECT * FROM "ZWAMEDIAITEM"'):
+                media_id = self._first_value(media, "Z_PK")
+                message_id = self._first_value(media, "ZMESSAGE")
+                if media_id is not None:
+                    media_by_id[media_id] = media
+                if message_id is not None:
+                    media_by_message[message_id] = media
+
+        group_members: dict[Any, tuple[str | None, str | None]] = {}
+        if "ZWAGROUPMEMBER" in self.tables:
+            for member in self.connection.execute('SELECT * FROM "ZWAGROUPMEMBER"'):
+                member_id = self._first_value(member, "Z_PK")
+                jid = self._ios_jid(self._first_value(member, "ZMEMBERJID", "ZJID", "ZCONTACTJID"))
+                name = self._first_value(member, "ZCONTACTNAME", "ZDISPLAYNAME", "ZNAME")
+                if member_id is not None:
+                    group_members[member_id] = (jid, str(name) if name else None)
+
+        quote_map: dict[Any, str] = {}
+        parent_columns = {"ZPARENTMESSAGE", "ZQUOTEDMESSAGE"} & message_columns
+        if parent_columns and {"Z_PK", "ZSTANZAID"}.issubset(message_columns):
+            for row in self.connection.execute('SELECT "Z_PK", "ZSTANZAID" FROM "ZWAMESSAGE"'):
+                if row["ZSTANZAID"]:
+                    quote_map[row["Z_PK"]] = bounded_id(row["ZSTANZAID"])
+
+        cursor = self.connection.execute('SELECT * FROM "ZWAMESSAGE" ORDER BY "Z_PK"')
+        while rows := cursor.fetchmany(batch_size):
+            for row in rows:
+                source_row_id = self._first_value(row, "Z_PK")
+                chat = self._chats.get(self._first_value(row, "ZCHATSESSION", "ZCHAT", "ZSESSION"))
+                timestamp = normalize_ios_timestamp(
+                    self._first_value(row, "ZMESSAGEDATE", "ZTIMESTAMP", "ZSENTDATE")
+                )
+                if not chat or not timestamp:
+                    continue
+
+                media = media_by_message.get(source_row_id)
+                if media is None:
+                    media = media_by_id.get(self._first_value(row, "ZMEDIAITEM", "ZMEDIA"))
+                media_reference = (
+                    self._first_value(
+                        media,
+                        "ZMEDIALOCALPATH",
+                        "ZFILEPATH",
+                        "ZPATH",
+                        "ZMEDIALOCALUUID",
+                        "ZMEDIAURL",
+                    )
+                    if media
+                    else None
+                )
+                media_mime = (
+                    self._first_value(media, "ZCONTENTTYPE", "ZMIMETYPE", "ZMEDIAMIMETYPE")
+                    if media
+                    else None
+                )
+                caption = (
+                    self._first_value(media, "ZMEDIACAPTION", "ZCAPTION", "ZTITLE")
+                    if media
+                    else None
+                )
+                from_me = bool(self._first_value(row, "ZISFROMME", "ZFROMME") or False)
+                sender_jid = self._ios_jid(
+                    self._first_value(row, "ZFROMJID", "ZSENDERJID", "ZPARTICIPANTJID")
+                )
+                sender_name = None
+                group_member_id = self._first_value(row, "ZGROUPMEMBER", "ZSENDER")
+                if group_member_id in group_members:
+                    member_jid, member_name = group_members[group_member_id]
+                    sender_jid = sender_jid or member_jid
+                    sender_name = member_name
+                if not sender_jid and not from_me and not chat.is_group:
+                    sender_jid = chat.jid
+
+                type_value = self._first_value(row, "ZMESSAGETYPE", "ZTYPE") or 0
+                try:
+                    media_type = IOS_MEDIA_TYPES.get(int(type_value))
+                except (TypeError, ValueError):
+                    media_type = None
+                parent_id = self._first_value(row, "ZPARENTMESSAGE", "ZQUOTEDMESSAGE")
+                direct_quote = self._first_value(row, "ZQUOTEDSTANZAID")
+                message_id = self._first_value(row, "ZSTANZAID", "ZMESSAGEID")
+                content = self._first_value(row, "ZTEXT", "ZMESSAGETEXT", "ZCAPTION") or caption
+
+                yield MessageRecord(
+                    id=bounded_id(message_id or f"ios-row-{source_row_id}"),
+                    chat_jid=chat.jid,
+                    sender_jid=bounded_id(sender_jid) if sender_jid else None,
+                    sender_name=(
+                        "Você"
+                        if from_me
+                        else sender_name
+                        or self._contacts.get(sender_jid or "")
+                        or (self._fallback_name(sender_jid) if sender_jid else None)
+                    ),
+                    content=str(content) if content is not None else None,
+                    timestamp=timestamp,
+                    from_me=from_me,
+                    has_media=bool(media_reference or media_type),
+                    media_type=media_type,
+                    media_reference=str(media_reference) if media_reference else None,
+                    media_mime=str(media_mime) if media_mime else None,
+                    quoted_message_id=(
+                        bounded_id(direct_quote) if direct_quote else quote_map.get(parent_id)
                     ),
                 )
