@@ -21,6 +21,7 @@ services:
       - internal
 
   app:
+    image: ${WLAV_IMAGE:-ghcr.io/facrf/wlav:latest}
     build:
       context: .
       dockerfile: docker/app.Dockerfile
@@ -64,6 +65,7 @@ services:
       - internal
 
   ingestor:
+    image: ${WLAV_IMAGE:-ghcr.io/facrf/wlav:latest}
     build:
       context: .
       dockerfile: docker/app.Dockerfile
@@ -89,6 +91,7 @@ services:
       - internal
 
   backup:
+    image: ${WLAV_IMAGE:-ghcr.io/facrf/wlav:latest}
     build:
       context: .
       dockerfile: docker/app.Dockerfile

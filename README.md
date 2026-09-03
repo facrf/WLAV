@@ -60,6 +60,31 @@ Na inicialização, `docker/init.sql` prepara o primeiro banco e o contêiner `a
 executa `alembic upgrade head`. Nas atualizações futuras, as migrações preservam
 os dados já importados.
 
+### Usar a imagem pronta do GHCR
+
+A imagem multi-arquitetura (`linux/amd64` e `linux/arm64`) é publicada em
+`ghcr.io/facrf/wlav`. O Compose mantém a configuração de build local, portanto
+o comando recomendado para desenvolvimento continua funcionando:
+
+```bash
+docker compose up -d --build
+```
+
+Para instalar ou atualizar sem compilar localmente, defina a tag desejada em
+`.env` e solicite explicitamente a imagem pronta:
+
+```env
+WLAV_IMAGE=ghcr.io/facrf/wlav:latest
+```
+
+```bash
+docker compose pull
+docker compose up -d --no-build
+```
+
+Além de `latest`, cada publicação gera a tag `main`, uma tag curta baseada no
+commit (`sha-...`) e, para tags Git como `v1.2.3`, as tags `1.2.3` e `1.2`.
+
 ## 2. Importar pela interface
 
 Clique no botão **↑ Importar backup** no cabeçalho lateral. É possível enviar:
@@ -210,8 +235,9 @@ backups manuais nunca entram nessa limpeza.
 
 No Portainer, escolha **Stacks → Add stack → Repository**, informe o repositório
 Git deste projeto e use `docker-compose.yml` como caminho do Compose. Configure
-as variáveis de ambiente na própria Stack. O modo Repository é necessário porque
-a imagem é construída a partir do código-fonte e do `docker/app.Dockerfile`.
+as variáveis de ambiente na própria Stack. Por padrão, a Stack pode baixar
+`ghcr.io/facrf/wlav:latest`; ainda é possível selecionar o build a partir do
+código-fonte em ambientes de desenvolvimento.
 
 Para uma stack dedicada, o YAML abaixo pode ser salvo no repositório como
 `portainer-stack.yml`. Antes de ativar `backup`, crie no host
@@ -240,9 +266,7 @@ services:
     networks: [wlav_internal]
 
   app:
-    build:
-      context: .
-      dockerfile: docker/app.Dockerfile
+    image: ${WLAV_IMAGE:-ghcr.io/facrf/wlav:latest}
     restart: unless-stopped
     depends_on:
       db:
@@ -271,9 +295,7 @@ services:
     networks: [wlav_internal]
 
   backup:
-    build:
-      context: .
-      dockerfile: docker/app.Dockerfile
+    image: ${WLAV_IMAGE:-ghcr.io/facrf/wlav:latest}
     restart: unless-stopped
     depends_on:
       app:
@@ -312,6 +334,7 @@ WLAV_PORT=21001
 WLAV_BIND_ADDRESS=0.0.0.0
 WLAV_UID=1000
 WLAV_GID=1000
+WLAV_IMAGE=ghcr.io/facrf/wlav:latest
 ```
 
 Se a senha contiver `@`, `:`, `/`, `?` ou `#`, aplique percent-encoding somente
@@ -352,6 +375,37 @@ docker compose exec app alembic upgrade head
 
 Nunca execute downgrade sem um backup íntegro recente.
 
+## Publicação da imagem e proteção dos espelhos
+
+O workflow [`.github/workflows/publish-ghcr.yml`](.github/workflows/publish-ghcr.yml)
+é o único responsável por construir imagens do WLAV. Ele roda em pushes para
+`main`, em tags iniciadas por `v` e manualmente pelo GitHub Actions. Antes da
+publicação, executa Ruff e Pytest; depois publica somente em
+`ghcr.io/facrf/wlav`, com cache, SBOM e proveniência OCI.
+
+O token usado pelo push mirror para o GitHub precisa ter acesso de escrita ao
+conteúdo e aos workflows do repositório. Em um PAT clássico, inclua o escopo
+`workflow`; em um token fine-grained, limite-o ao repositório `facrf/WLAV` e
+conceda **Contents: Read and write** e **Workflows: Read and write**. Sem essa
+permissão, o GitHub pode recusar a inclusão ou atualização deste workflow.
+
+Há três camadas para impedir builds nos espelhos:
+
+1. o job exige simultaneamente `github.server_url == 'https://github.com'` e
+   `github.repository == 'facrf/WLAV'`;
+2. `.gitea/workflows` e `.forgejo/workflows` existem sem nenhum YAML, evitando o
+   fallback dessas plataformas para `.github/workflows`;
+3. no Gitea e no Forgejo, mantenha desmarcada a unidade **Actions** em
+   **Settings → Units → Overview** para cada repositório espelho. Se a instância
+   inteira não usa Actions, o administrador também pode definir
+   `[actions] ENABLED = false` no `app.ini`.
+
+Não cadastre tokens do GHCR no Gitea ou no Forgejo. O GitHub Actions usa apenas o
+`GITHUB_TOKEN` efêmero, limitado pelas permissões declaradas no workflow. Na
+primeira publicação, o pacote do GHCR nasce privado; para permitir pulls sem
+login, abra o pacote `wlav` no GitHub, acesse **Package settings → Change
+visibility** e torne-o público. Essa alteração de visibilidade é irreversível.
+
 ## Operação e diagnóstico
 
 ```bash
@@ -384,6 +438,9 @@ backend/migrations/   revisões Alembic
 frontend/             interface estática
 ingestor/             Android/iOS, mídia, cifragem e backups
 docker/               imagem e inicialização PostgreSQL
+.github/workflows/     testes e publicação exclusiva no GHCR
+.gitea/workflows/      bloqueio do fallback no espelho Gitea
+.forgejo/workflows/    bloqueio do fallback no espelho Forgejo
 tests/                testes automatizados
 imports/              entrada CLI ignorada pelo Git
 exports/              backups ignorados pelo Git
