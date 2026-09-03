@@ -36,15 +36,18 @@ services:
       API_PAGE_SIZE: ${API_PAGE_SIZE:-50}
       API_MAX_PAGE_SIZE: ${API_MAX_PAGE_SIZE:-200}
       IMPORT_ROOT: /var/wlav_imports
+      WHATSAPP_KEY_PATH: /var/lib/wlav/secrets/whatsapp.key
       TMPDIR: /var/wlav_imports
       UPLOAD_MAX_GB: ${UPLOAD_MAX_GB:-100}
       THUMBNAIL_MAX_SIZE: ${THUMBNAIL_MAX_SIZE:-480}
+      WHATSAPP_EXPORT_TIMEZONE: ${WHATSAPP_EXPORT_TIMEZONE:-America/Sao_Paulo}
       TZ: America/Sao_Paulo
     ports:
       - "${WLAV_BIND_ADDRESS:-0.0.0.0}:${WLAV_PORT:-21001}:21001"
     volumes:
       - whatsapp_media:/var/whatsapp_media
       - import_spool:/var/wlav_imports
+      - key_store:/var/lib/wlav/secrets
     read_only: true
     tmpfs:
       - /tmp:size=64m
@@ -129,6 +132,7 @@ volumes:
   postgres_data:
   whatsapp_media:
   import_spool:
+  key_store:
 
 networks:
   internal:

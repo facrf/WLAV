@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "wlav"
 version = "1.0.0"
-description = "WhatsApp Local Archive & Viewer"
+description = "WhatsApp Local Archive Vault"
 readme = "README.md"
 requires-python = ">=3.12"
 license = { text = "MIT" }
@@ -20,6 +20,7 @@ dependencies = [
   "psycopg[binary]>=3.2.9,<4",
   "pydantic-settings>=2.10,<3",
   "python-multipart>=0.0.20,<1",
+  "wa-crypt-tools @ https://github.com/ElDavoo/wa-crypt-tools/archive/354bf5b0d1b4dfff03bf24c70c937c57d25d9782.tar.gz",
 ]
 
 [project.optional-dependencies]

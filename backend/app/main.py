@@ -4,6 +4,7 @@ import hashlib
 import json
 import logging
 import mimetypes
+import shutil
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
@@ -16,6 +17,7 @@ from fastapi import (
     Depends,
     FastAPI,
     File,
+    Form,
     HTTPException,
     Query,
     Request,
@@ -26,7 +28,9 @@ from fastapi.staticfiles import StaticFiles
 from sqlalchemy import and_, func, literal_column, or_, select, text
 from sqlalchemy.orm import Session
 
+from ingestor.key_store import WhatsAppKeyStore
 from ingestor.thumbnails import thumbnail_relative
+from ingestor.upload import safe_relative_path
 
 from .config import get_settings
 from .database import SessionLocal, engine, get_session
@@ -40,6 +44,8 @@ from .schemas import (
     QuoteOut,
     SearchPage,
     SearchResult,
+    WhatsAppKeyInput,
+    WhatsAppKeyStatus,
 )
 
 settings = get_settings()
@@ -49,6 +55,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger("wlav")
 running_imports: set[asyncio.Task] = set()
+whatsapp_key_store = WhatsAppKeyStore(settings.whatsapp_key_path)
+
+
+def _import_source(job_id: str) -> Path:
+    directory = settings.import_root / job_id
+    uploaded_file = directory / "source.upload"
+    return uploaded_file if uploaded_file.is_file() else directory / "source.directory"
 
 
 def _resume_interrupted_imports() -> None:
@@ -57,15 +70,15 @@ def _resume_interrupted_imports() -> None:
             session.scalars(select(ImportJob).where(ImportJob.status.in_(("queued", "running"))))
         )
         for job in jobs:
-            upload_path = settings.import_root / job.id / "source.upload"
-            if not upload_path.is_file():
+            upload_path = _import_source(job.id)
+            if not upload_path.exists():
                 job.status = "failed"
                 job.error = "Arquivo temporário ausente após reinicialização"
                 job.completed_at = datetime.now(UTC)
         session.commit()
     for job in jobs:
-        upload_path = settings.import_root / job.id / "source.upload"
-        if not upload_path.is_file():
+        upload_path = _import_source(job.id)
+        if not upload_path.exists():
             continue
         task = asyncio.create_task(asyncio.to_thread(run_import_job, job.id, upload_path))
         running_imports.add(task)
@@ -76,6 +89,8 @@ def _resume_interrupted_imports() -> None:
 async def lifespan(_: FastAPI):
     settings.media_root.mkdir(parents=True, exist_ok=True)
     settings.import_root.mkdir(parents=True, exist_ok=True)
+    settings.whatsapp_key_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    settings.whatsapp_key_path.parent.chmod(0o700)
     with engine.connect() as connection:
         connection.execute(text("SELECT 1"))
     _resume_interrupted_imports()
@@ -313,6 +328,34 @@ def list_imports(
     )
 
 
+@app.get("/api/settings/whatsapp-key", response_model=WhatsAppKeyStatus)
+def whatsapp_key_status() -> WhatsAppKeyStatus:
+    status = whatsapp_key_store.status()
+    return WhatsAppKeyStatus(
+        saved=status.saved,
+        fingerprint=status.fingerprint,
+        updated_at=status.updated_at,
+    )
+
+
+@app.put("/api/settings/whatsapp-key", response_model=WhatsAppKeyStatus)
+def save_whatsapp_key(payload: WhatsAppKeyInput) -> WhatsAppKeyStatus:
+    try:
+        status = whatsapp_key_store.save(payload.key)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return WhatsAppKeyStatus(
+        saved=status.saved,
+        fingerprint=status.fingerprint,
+        updated_at=status.updated_at,
+    )
+
+
+@app.delete("/api/settings/whatsapp-key", status_code=204)
+def delete_whatsapp_key() -> None:
+    whatsapp_key_store.delete()
+
+
 @app.get("/api/imports/{job_id}", response_model=ImportJobOut)
 def get_import(job_id: str, session: SessionDep) -> ImportJob:
     job = session.get(ImportJob, job_id)
@@ -325,36 +368,75 @@ def get_import(job_id: str, session: SessionDep) -> ImportJob:
 async def create_import(
     background_tasks: BackgroundTasks,
     session: SessionDep,
-    file: Annotated[UploadFile, File(description="SQLite ou pacote ZIP/TAR/TAR.GZ")],
+    file: Annotated[
+        list[UploadFile],
+        File(description="TXT/ZIP exportado, SQLite, pacote ou arquivos de uma pasta"),
+    ],
+    owner_name: Annotated[str | None, Form(max_length=200)] = None,
+    date_order: Annotated[str, Form()] = "auto",
 ) -> ImportJob:
+    if not file:
+        raise HTTPException(status_code=422, detail="Selecione ao menos um arquivo")
+    if date_order not in {"auto", "dmy", "mdy"}:
+        raise HTTPException(status_code=422, detail="Ordem de data inválida")
     job_id = str(uuid4())
     job_directory = settings.import_root / job_id
     job_directory.mkdir(parents=True, exist_ok=False)
-    upload_path = job_directory / "source.upload"
     maximum = settings.upload_max_gb * 1024**3
     size = 0
     digest = hashlib.sha256()
     try:
-        with upload_path.open("wb") as handle:
-            while chunk := await file.read(4 * 1024 * 1024):
-                size += len(chunk)
-                if size > maximum:
-                    raise HTTPException(
-                        status_code=413,
-                        detail=f"Upload excede o limite de {settings.upload_max_gb} GB",
-                    )
-                digest.update(chunk)
-                handle.write(chunk)
+        relative_names = [
+            safe_relative_path(item.filename or f"arquivo-{index}")
+            for index, item in enumerate(file)
+        ]
+        is_directory = len(file) > 1 or any(len(path.parts) > 1 for path in relative_names)
+        upload_path = job_directory / ("source.directory" if is_directory else "source.upload")
+        if is_directory:
+            upload_path.mkdir()
+        targets: set[Path] = set()
+        for item, relative in zip(file, relative_names, strict=True):
+            target = upload_path / relative if is_directory else upload_path
+            resolved = target.resolve()
+            root = upload_path.resolve() if is_directory else job_directory.resolve()
+            if not resolved.is_relative_to(root) or resolved in targets:
+                raise HTTPException(status_code=400, detail="Caminho duplicado ou inseguro")
+            targets.add(resolved)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            digest.update(relative.as_posix().encode())
+            with target.open("wb") as handle:
+                while chunk := await item.read(4 * 1024 * 1024):
+                    size += len(chunk)
+                    if size > maximum:
+                        raise HTTPException(
+                            status_code=413,
+                            detail=f"Upload excede o limite de {settings.upload_max_gb} GB",
+                        )
+                    digest.update(chunk)
+                    handle.write(chunk)
+        (job_directory / "options.json").write_text(
+            json.dumps(
+                {"owner_name": (owner_name or "").strip(), "date_order": date_order},
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
     except Exception:
-        upload_path.unlink(missing_ok=True)
-        job_directory.rmdir()
+        shutil.rmtree(job_directory, ignore_errors=True)
         raise
     finally:
-        await file.close()
+        for item in file:
+            await item.close()
+
+    if is_directory:
+        first_root = relative_names[0].parts[0]
+        display_name = f"{first_root}/ ({len(file)} arquivos)"
+    else:
+        display_name = file[0].filename or "backup"
 
     job = ImportJob(
         id=job_id,
-        filename=(file.filename or "backup")[:500],
+        filename=display_name[:500],
         source_sha256=digest.hexdigest(),
         status="queued",
     )

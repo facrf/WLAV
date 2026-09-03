@@ -1,9 +1,14 @@
-# WLAV — WhatsApp Local Archive & Viewer
+# WLAV — WhatsApp Local Archive Vault
 
-O WLAV transforma backups do WhatsApp em um arquivo histórico pesquisável para
-PCs e servidores domésticos. Ele guarda mensagens no PostgreSQL, organiza as
-mídias em volume persistente e oferece uma interface semelhante ao WhatsApp Web.
-Tudo funciona localmente em Docker, sem serviços externos.
+O WLAV transforma backups locais do WhatsApp Android em um arquivo histórico
+pesquisável para PCs e servidores domésticos. Ele abre `msgstore.db.crypt15`
+com a chave de 64 caracteres fornecida pelo proprietário, guarda mensagens no
+PostgreSQL e organiza mídias em volume persistente. Tudo funciona localmente em
+Docker, sem Google Drive nem serviços externos.
+
+O WLAV é um projeto independente e não é afiliado, aprovado ou mantido pelo
+WhatsApp ou pela Meta. Os formatos `.crypt*` não constituem uma API pública e
+podem mudar.
 
 ## Escopo de segurança
 
@@ -16,9 +21,13 @@ que normalmente têm muito mais armazenamento que smartphones.
 - permita a porta no firewall somente para a sua sub-rede confiável;
 - mantenha `imports/`, `exports/`, `secrets/` e os volumes Docker fora de
   compartilhamentos públicos.
+- use criptografia de disco no host; a chave salva protege dados em repouso
+  somente enquanto o volume LUKS estiver fechado.
 
 Não há autenticação na aplicação por decisão de projeto. `WLAV_BIND_ADDRESS`
 pode ser definido como o IP LAN do servidor para restringir a interface usada.
+Enquanto o serviço estiver ligado, qualquer pessoa com acesso à interface poderá
+usar a chave salva para importar um backup, embora a API nunca revele seu valor.
 
 ## Recursos
 
@@ -26,13 +35,16 @@ pode ser definido como o IP LAN do servidor para restringir a interface usada.
 - API FastAPI, paginação por cursor e mídia com HTTP `Range`;
 - tema claro/escuro, busca global, infinite scroll, lightbox e players nativos;
 - importação posterior de quantos backups forem necessários, pela UI ou CLI;
+- abertura local de `msgstore.db.crypt15` com chave persistente de 64 caracteres;
+- importação de conversas exportadas oficialmente em TXT/ZIP, inclusive com mídia;
 - UPSERT idempotente: mensagens existentes são atualizadas, não duplicadas;
 - Android moderno/legado e suporte adaptativo ao `ChatStorage.sqlite` do iOS;
 - thumbnails de fotos, stickers e vídeos com Pillow/FFmpeg;
 - migrações de banco com Alembic executadas automaticamente;
 - backup portátil com checksums SHA-256 e cifragem AES-256-GCM opcional;
 - backup periódico cifrado, verificação automática e retenção configurável;
-- licença MIT.
+- núcleo próprio sob licença MIT; compatibilidade `.crypt*` isolada em componente
+  GPL-3.0-or-later, documentado ao fim deste arquivo.
 
 ## 1. Instalação com Docker Compose
 
@@ -89,10 +101,71 @@ commit (`sha-...`) e, para tags Git como `v1.2.3`, as tags `1.2.3` e `1.2`.
 
 Clique no botão **↑ Importar backup** no cabeçalho lateral. É possível enviar:
 
+- um `msgstore.db.crypt15` Android e a pasta `Media`;
+- um `.txt` ou ZIP criado por **Exportar conversa** no WhatsApp;
 - um `msgstore.db` Android descriptografado;
 - um `ChatStorage.sqlite` iOS descriptografado;
 - um ZIP, TAR ou TAR.GZ contendo o banco e as pastas de mídia;
 - um backup portátil WLAV não cifrado.
+
+### Backup Android criptografado
+
+No WhatsApp Android, abra **Configurações → Conversas → Backup de conversas →
+Backup criptografado de ponta a ponta** e escolha a opção de chave com 64
+caracteres. Guarde essa chave: ela não pode ser recuperada pelo WLAV.
+
+Na tela de importação:
+
+1. cole e salve a chave no cofre local;
+2. copie do telefone a pasta
+   `Android/media/com.whatsapp/WhatsApp` ou pelo menos `Databases` e `Media`;
+3. use **Selecionar a pasta WhatsApp**, ou compacte essa estrutura em ZIP;
+4. o WLAV escolhe primeiro `msgstore.db.crypt15`, descriptografa em área
+   temporária, valida o SQLite e executa a importação idempotente;
+5. o banco aberto é removido ao final, inclusive quando há falha.
+
+A chave fica no volume Docker `key_store`, em
+`/var/lib/wlav/secrets/whatsapp.key`, com modo `0600`. A API informa apenas
+uma impressão SHA-256 curta para identificação; ela não retorna o segredo. A
+chave não entra nos backups portáteis do WLAV e deve ter uma cópia separada e
+segura. `docker compose down -v` apaga também esse volume.
+
+O suporte principal é `.crypt15` com chave hexadecimal de 64 caracteres.
+Backups `.crypt12` e `.crypt14` antigos podem exigir o arquivo de chave
+privado da instalação antiga e, portanto, não são garantidos pela chave exibida
+nas configurações atuais.
+
+### Exportação oficial de uma conversa
+
+No celular, abra a conversa e use **Mais opções → Mais → Exportar conversa**.
+Escolha incluir ou não as mídias e salve o TXT/ZIP no computador. Na tela do
+WLAV, informe opcionalmente o seu nome exatamente como aparece no TXT; isso
+permite diferenciar mensagens enviadas e recebidas. Se o nome não for informado,
+o WLAV tenta inferi-lo em conversas com duas pessoas.
+
+O TXT não contém JIDs, confirmações de entrega, respostas citadas nem todos os
+metadados internos. O WLAV não inventa esses dados. Datas sem fuso são
+interpretadas usando `WHATSAPP_EXPORT_TIMEZONE` (padrão
+`America/Sao_Paulo`) e gravadas em UTC. Em exportações norte-americanas, escolha
+**mês/dia/ano** na tela; o modo automático usa dia/mês como padrão quando a data
+é ambígua.
+
+Reimportar a mesma exportação é seguro: o identificador estável considera
+conversa, horário, remetente, conteúdo, mídia e a ocorrência de mensagens
+idênticas.
+
+### Pasta copiada do telefone
+
+A tela também permite selecionar uma pasta `WhatsApp` completa. O navegador
+envia os arquivos mantendo os caminhos relativos e o WLAV procura bancos,
+exportações textuais e mídias. Esse modo é útil para organizar a entrada, mas não
+remove a criptografia do WhatsApp.
+
+Se a pasta contiver um `msgstore*.db.crypt15`, a chave salva será utilizada
+automaticamente. O WLAV não extrai chaves do aplicativo, não contorna permissões
+do Android e não envia dados a serviços externos.
+
+### Banco SQLite com mídia
 
 Para incluir mídias, compacte uma estrutura semelhante a esta:
 
@@ -275,6 +348,7 @@ services:
       DATABASE_URL: ${DATABASE_URL}
       MEDIA_ROOT: /var/whatsapp_media
       IMPORT_ROOT: /var/wlav_imports
+      WHATSAPP_KEY_PATH: /var/lib/wlav/secrets/whatsapp.key
       TMPDIR: /var/wlav_imports
       UPLOAD_MAX_GB: ${UPLOAD_MAX_GB:-100}
       THUMBNAIL_MAX_SIZE: ${THUMBNAIL_MAX_SIZE:-480}
@@ -284,6 +358,7 @@ services:
     volumes:
       - wlav_media:/var/whatsapp_media
       - wlav_imports:/var/wlav_imports
+      - wlav_keys:/var/lib/wlav/secrets
     read_only: true
     tmpfs: [/tmp:size=64m]
     security_opt: [no-new-privileges:true]
@@ -319,6 +394,7 @@ volumes:
   wlav_postgres:
   wlav_media:
   wlav_imports:
+  wlav_keys:
 
 networks:
   wlav_internal:
@@ -349,9 +425,12 @@ na parte da senha em `DATABASE_URL`.
 | `GET /api/chats/{jid}/messages?before=&limit=` | Histórico por cursor |
 | `GET /api/chats/{jid}/messages?around={id}` | Janela ao redor de uma mensagem |
 | `GET /api/search?q=&page=&limit=&chat_jid=` | Busca FTS global |
-| `POST /api/imports` | Upload de um novo backup |
+| `POST /api/imports` | Multipart com `file` (um ou vários), `owner_name` opcional e `date_order` (`auto`, `dmy` ou `mdy`) |
 | `GET /api/imports` | Histórico de importações |
 | `GET /api/imports/{id}` | Progresso de uma importação |
+| `GET /api/settings/whatsapp-key` | Estado e impressão da chave, nunca o valor |
+| `PUT /api/settings/whatsapp-key` | Salva ou substitui a chave de 64 caracteres |
+| `DELETE /api/settings/whatsapp-key` | Remove a chave salva |
 | `GET /media/{caminho}` | Mídia local com suporte a `Range` |
 
 Documentação interativa: `http://localhost:21001/api/docs`.
@@ -415,8 +494,8 @@ docker compose exec db pg_isready -U wlav -d wlav
 docker compose down                 # preserva todos os volumes
 ```
 
-`docker compose down -v` apaga definitivamente banco, mídias e spool. Ele não é
-um comando normal de manutenção.
+`docker compose down -v` apaga definitivamente banco, mídias, spool e a chave
+salva do WhatsApp. Ele não é um comando normal de manutenção.
 
 ## Desenvolvimento
 
@@ -446,6 +525,13 @@ imports/              entrada CLI ignorada pelo Git
 exports/              backups ignorados pelo Git
 secrets/              senhas locais ignoradas pelo Git
 ```
+
+### Componente de compatibilidade com backups cifrados
+
+A descriptografia é executada em processo separado pelo
+[wa-crypt-tools](https://github.com/ElDavoo/wa-crypt-tools), GPL-3.0-or-later.
+O restante do WLAV continua sob MIT. A versão exata está fixada em
+`pyproject.toml`; consulte [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 ## Recomendações adicionais
 

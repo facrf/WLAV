@@ -42,6 +42,9 @@ const elements = {
   importClose: document.querySelector("#importClose"),
   importForm: document.querySelector("#importForm"),
   backupFile: document.querySelector("#backupFile"),
+  directoryFiles: document.querySelector("#directoryFiles"),
+  ownerName: document.querySelector("#ownerName"),
+  dateOrder: document.querySelector("#dateOrder"),
   selectedFile: document.querySelector("#selectedFile"),
   importSubmit: document.querySelector("#importSubmit"),
   importProgress: document.querySelector("#importProgress"),
@@ -49,6 +52,10 @@ const elements = {
   progressDetail: document.querySelector("#progressDetail"),
   progressBar: document.querySelector("#progressBar"),
   importHistory: document.querySelector("#importHistory"),
+  whatsappKey: document.querySelector("#whatsappKey"),
+  keyStatus: document.querySelector("#keyStatus"),
+  keySave: document.querySelector("#keySave"),
+  keyDelete: document.querySelector("#keyDelete"),
 };
 
 function initials(name) {
@@ -86,6 +93,19 @@ async function api(path) {
     throw new Error(detail);
   }
   return response.json();
+}
+
+async function apiRequest(path, options) {
+  const response = await fetch(path, {
+    ...options,
+    headers: { Accept: "application/json", ...(options.headers || {}) },
+  });
+  if (!response.ok) {
+    let detail = `Erro ${response.status}`;
+    try { detail = (await response.json()).detail || detail; } catch (_) { /* resposta sem JSON */ }
+    throw new Error(detail);
+  }
+  return response.status === 204 ? null : response.json();
 }
 
 function setSidebarStatus(message = "") {
@@ -285,7 +305,7 @@ function messageElement(message) {
   const bubble = document.createElement("div");
   bubble.className = "bubble";
 
-  if (!message.from_me && state.activeChat?.is_group && message.sender_name) {
+  if (!message.from_me && message.sender_name) {
     const sender = document.createElement("div");
     sender.className = "sender";
     sender.textContent = message.sender_name;
@@ -518,7 +538,22 @@ async function loadImportHistory() {
   }
 }
 
-function uploadBackup(file) {
+function renderKeyStatus(status) {
+  elements.keyStatus.textContent = status.saved
+    ? `Salva · identificação ${status.fingerprint}`
+    : "Nenhuma chave salva";
+  elements.keyDelete.hidden = !status.saved;
+}
+
+async function loadKeyStatus() {
+  try {
+    renderKeyStatus(await api("/api/settings/whatsapp-key"));
+  } catch (error) {
+    elements.keyStatus.textContent = error.message;
+  }
+}
+
+function uploadBackup(files) {
   return new Promise((resolve, reject) => {
     const request = new XMLHttpRequest();
     request.open("POST", "/api/imports");
@@ -535,7 +570,11 @@ function uploadBackup(file) {
     });
     request.addEventListener("error", () => reject(new Error("Falha de rede durante o upload")));
     const body = new FormData();
-    body.append("file", file);
+    for (const file of files) {
+      body.append("file", file, file.webkitRelativePath || file.name);
+    }
+    body.append("owner_name", elements.ownerName.value.trim());
+    body.append("date_order", elements.dateOrder.value);
     request.send(body);
   });
 }
@@ -591,24 +630,71 @@ elements.lightboxClose.addEventListener("click", () => elements.lightbox.close()
 elements.lightbox.addEventListener("click", (event) => { if (event.target === elements.lightbox) elements.lightbox.close(); });
 elements.importButton.addEventListener("click", () => {
   loadImportHistory();
+  loadKeyStatus();
   elements.importDialog.showModal();
 });
 elements.importClose.addEventListener("click", () => elements.importDialog.close());
+elements.keySave.addEventListener("click", async () => {
+  const key = elements.whatsappKey.value.trim();
+  if (!key) {
+    toast("Cole a chave de 64 caracteres.");
+    return;
+  }
+  elements.keySave.disabled = true;
+  try {
+    const status = await apiRequest("/api/settings/whatsapp-key", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ key }),
+    });
+    elements.whatsappKey.value = "";
+    renderKeyStatus(status);
+    toast("Chave salva no cofre local.");
+  } catch (error) {
+    toast(error.message);
+  } finally {
+    elements.keySave.disabled = false;
+  }
+});
+elements.keyDelete.addEventListener("click", async () => {
+  if (!window.confirm("Remover a chave salva do WLAV?")) return;
+  try {
+    await apiRequest("/api/settings/whatsapp-key", { method: "DELETE" });
+    renderKeyStatus({ saved: false });
+    toast("Chave removida.");
+  } catch (error) {
+    toast(error.message);
+  }
+});
 elements.backupFile.addEventListener("change", () => {
   const file = elements.backupFile.files[0];
+  if (file) elements.directoryFiles.value = "";
   elements.selectedFile.textContent = file ? `${file.name} · ${(file.size / 1024 / 1024).toLocaleString("pt-BR", { maximumFractionDigits: 1 })} MB` : "Nenhum arquivo selecionado";
+});
+elements.directoryFiles.addEventListener("change", () => {
+  const files = [...elements.directoryFiles.files];
+  if (files.length) elements.backupFile.value = "";
+  const bytes = files.reduce((total, file) => total + file.size, 0);
+  elements.selectedFile.textContent = files.length
+    ? `${files[0].webkitRelativePath.split("/")[0]} · ${files.length.toLocaleString("pt-BR")} arquivos · ${(bytes / 1024 / 1024).toLocaleString("pt-BR", { maximumFractionDigits: 1 })} MB`
+    : "Nenhum arquivo selecionado";
 });
 elements.importForm.addEventListener("submit", async (event) => {
   event.preventDefault();
-  const file = elements.backupFile.files[0];
-  if (!file) return;
+  const files = elements.backupFile.files.length
+    ? [...elements.backupFile.files]
+    : [...elements.directoryFiles.files];
+  if (!files.length) {
+    toast("Escolha um arquivo ou uma pasta.");
+    return;
+  }
   elements.importSubmit.disabled = true;
   elements.importProgress.hidden = false;
   elements.progressBar.value = 0;
   elements.progressTitle.textContent = "Enviando backup…";
   elements.progressDetail.textContent = "0% enviado";
   try {
-    const job = await uploadBackup(file);
+    const job = await uploadBackup(files);
     elements.progressTitle.textContent = "Arquivo recebido; iniciando importação…";
     elements.progressBar.removeAttribute("value");
     pollImport(job.id);

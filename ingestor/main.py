@@ -154,7 +154,7 @@ def build_parser() -> argparse.ArgumentParser:
     settings = get_settings()
     parser = argparse.ArgumentParser(
         prog="wlav",
-        description="Importação e portabilidade do WhatsApp Local Archive & Viewer",
+        description="Importação e portabilidade do WhatsApp Local Archive Vault",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 

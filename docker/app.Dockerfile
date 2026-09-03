@@ -8,16 +8,19 @@ WORKDIR /app
 
 RUN groupadd --system --gid 10001 wlav \
     && useradd --system --uid 10001 --gid wlav --home-dir /app wlav \
-    && mkdir -p /var/whatsapp_media /var/wlav_imports /imports /exports \
-    && chown -R wlav:wlav /app /var/whatsapp_media /var/wlav_imports /exports \
-    && chmod 0777 /var/whatsapp_media /var/wlav_imports
+    && mkdir -p /var/whatsapp_media /var/wlav_imports /var/lib/wlav/secrets /imports /exports \
+    && chown -R wlav:wlav /app /var/whatsapp_media /var/wlav_imports /var/lib/wlav /exports \
+    && chmod 0777 /var/whatsapp_media /var/wlav_imports \
+    && chmod 0700 /var/lib/wlav/secrets
 
-COPY --chown=wlav:wlav pyproject.toml README.md LICENSE alembic.ini ./
+COPY --chown=wlav:wlav pyproject.toml README.md LICENSE THIRD_PARTY_NOTICES.md alembic.ini ./
 COPY --chown=wlav:wlav backend ./backend
 COPY --chown=wlav:wlav ingestor ./ingestor
 COPY --chown=wlav:wlav frontend ./frontend
+COPY --chown=root:root docker/wlav-wadecrypt /usr/local/bin/wlav-wadecrypt
 
-RUN pip install --no-cache-dir .
+RUN chmod 0555 /usr/local/bin/wlav-wadecrypt \
+    && pip install --no-cache-dir .
 
 USER wlav
 

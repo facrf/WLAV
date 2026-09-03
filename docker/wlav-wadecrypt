@@ -1,0 +1,29 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# Adaptador independente para wa-crypt-tools. Ele mantém a chave fora da linha
+# de comando do sistema operacional e executa o utilitário GPL em outro processo.
+
+import re
+import sys
+from pathlib import Path
+
+
+def main() -> None:
+    if len(sys.argv) != 4:
+        raise SystemExit("uso: wlav-wadecrypt CHAVE BACKUP DESTINO")
+    key_path, encrypted, decrypted = sys.argv[1:]
+    key = re.sub(r"[\s-]+", "", Path(key_path).read_text(encoding="ascii"))
+    if not re.fullmatch(r"[0-9a-fA-F]{64}", key):
+        raise SystemExit("chave inválida")
+
+    # A alteração de sys.argv ocorre apenas na memória deste processo. A chave
+    # não aparece na linha de comando visível por outros processos do host.
+    sys.argv = ["wadecrypt", "--no-mem", "--yes", key, encrypted, decrypted]
+    from wa_crypt_tools.wadecrypt import main as wadecrypt_main
+
+    wadecrypt_main()
+
+
+if __name__ == "__main__":
+    main()

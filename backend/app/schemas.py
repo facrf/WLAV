@@ -77,3 +77,13 @@ class ImportJobOut(BaseModel):
     created_at: datetime
     started_at: datetime | None
     completed_at: datetime | None
+
+
+class WhatsAppKeyInput(BaseModel):
+    key: str
+
+
+class WhatsAppKeyStatus(BaseModel):
+    saved: bool
+    fingerprint: str | None = None
+    updated_at: datetime | None = None

@@ -290,6 +290,17 @@ mark { border-radius: 3px; background: #ffe17c; color: #3a2f05; }
 .dialog-header h2 { margin: 0; font-family: Georgia, serif; font-size: 24px; font-weight: 500; }
 .dialog-header p { margin: 6px 0 0; color: var(--muted); font-size: 12px; line-height: 1.5; }
 #importForm { padding: 20px 24px; }
+.key-vault { margin: 18px 24px 0; padding: 14px; border: 1px solid var(--line); border-radius: 12px; background: var(--panel-soft); }
+.key-vault-heading { display: flex; align-items: start; justify-content: space-between; gap: 12px; }
+.key-vault-heading > div { display: grid; gap: 3px; }
+.key-vault-heading strong { font-size: 12px; }
+.key-vault-heading span, .key-vault p { color: var(--muted); font-size: 10px; }
+.key-vault-input { display: grid; grid-template-columns: 1fr auto; gap: 8px; margin-top: 10px; }
+.key-vault-input input { min-width: 0; padding: 8px 9px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); color: var(--text); font-family: ui-monospace, monospace; font-size: 11px; }
+.key-vault-input button { padding: 8px 11px; border: 0; border-radius: 8px; background: var(--accent); color: white; cursor: pointer; font-size: 11px; font-weight: 700; }
+.key-vault-input button:disabled { cursor: wait; opacity: .55; }
+.key-vault p { margin: 8px 0 0; line-height: 1.45; }
+.danger-link { padding: 2px; border: 0; background: transparent; color: #d94b55; cursor: pointer; font-size: 10px; }
 .upload-zone { display: grid; min-height: 150px; place-items: center; align-content: center; gap: 5px; padding: 20px; border: 1.5px dashed var(--accent); border-radius: 14px; background: var(--accent-soft); text-align: center; cursor: pointer; }
 .upload-zone:hover { filter: brightness(.98); }
 .upload-zone input { position: absolute; width: 1px; height: 1px; opacity: 0; }
@@ -297,6 +308,15 @@ mark { border-radius: 3px; background: #ffe17c; color: #3a2f05; }
 .upload-zone > span:last-of-type { color: var(--muted); font-size: 11px; }
 .upload-icon { color: var(--accent-strong); font-size: 30px; }
 .selected-file { overflow: hidden; margin: 10px 0; color: var(--muted); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.import-separator { display: flex; align-items: center; gap: 10px; margin: 10px 0; color: var(--muted); font-size: 10px; text-transform: uppercase; }
+.import-separator::before, .import-separator::after { height: 1px; flex: 1; background: var(--line); content: ""; }
+.directory-button { display: block; padding: 9px 12px; border: 1px solid var(--line); border-radius: 9px; text-align: center; cursor: pointer; font-size: 12px; font-weight: 650; }
+.directory-button:hover { background: var(--panel-soft); }
+.directory-button input { position: absolute; width: 1px; height: 1px; opacity: 0; }
+.import-options { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin: 14px 0 0; }
+.import-options label { display: grid; gap: 5px; color: var(--muted); font-size: 10px; }
+.import-options input, .import-options select { min-width: 0; padding: 8px 9px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); color: var(--text); font-size: 11px; }
+.format-note { margin: 10px 0; color: var(--muted); font-size: 10px; line-height: 1.45; }
 .local-warning { margin: 12px 0; padding: 9px 11px; border-radius: 8px; background: color-mix(in srgb, #e5a529 14%, var(--panel)); color: var(--muted); font-size: 11px; }
 .primary-button { width: 100%; padding: 10px 16px; border: 0; border-radius: 10px; background: var(--accent); color: white; cursor: pointer; font-weight: 700; }
 .primary-button:hover { background: var(--accent-strong); }
@@ -326,6 +346,8 @@ mark { border-radius: 3px; background: #ffe17c; color: #3a2f05; }
   .messages { padding-inline: 10px; }
   .bubble { max-width: 88%; }
   .search-wrap kbd { display: none; }
+  .import-options { grid-template-columns: 1fr; }
+  .key-vault-input { grid-template-columns: 1fr; }
 }
 
 @media (prefers-reduced-motion: reduce) {

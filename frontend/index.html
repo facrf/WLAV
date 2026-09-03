@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="color-scheme" content="light dark" />
     <meta name="description" content="Arquivo local de conversas do WhatsApp" />
-    <title>WLAV — Arquivo do WhatsApp</title>
+    <title>WLAV — Cofre local do WhatsApp</title>
     <link rel="stylesheet" href="/styles.css" />
   </head>
   <body>
@@ -16,7 +16,7 @@
             <div class="brand-mark" aria-hidden="true">W</div>
             <div>
               <strong>WLAV</strong>
-              <span>Arquivo local</span>
+              <span>Arquivo e cofre local</span>
             </div>
           </div>
           <button class="icon-button" id="importButton" type="button" aria-label="Importar outro backup" title="Importar backup">
@@ -84,19 +84,61 @@
     <dialog class="import-dialog" id="importDialog">
       <header class="dialog-header">
         <div>
-          <h2>Importar backup</h2>
-          <p>Adicione backups novos quando quiser. Mensagens existentes não serão duplicadas.</p>
+          <h2>Importar conversas</h2>
+          <p>Use uma exportação oficial do WhatsApp, um banco local ou uma pasta copiada do telefone.</p>
         </div>
         <button class="icon-button" id="importClose" type="button" aria-label="Fechar">×</button>
       </header>
+      <section class="key-vault">
+        <div class="key-vault-heading">
+          <div>
+            <strong>Chave do backup Android</strong>
+            <span id="keyStatus">Consultando…</span>
+          </div>
+          <button class="danger-link" id="keyDelete" type="button" hidden>Remover</button>
+        </div>
+        <div class="key-vault-input">
+          <input
+            id="whatsappKey"
+            type="password"
+            maxlength="100"
+            autocomplete="off"
+            spellcheck="false"
+            placeholder="Cole os 64 caracteres da chave"
+            aria-label="Chave de 64 caracteres do backup do WhatsApp"
+          />
+          <button id="keySave" type="button">Salvar chave</button>
+        </div>
+        <p>Guardada somente no volume local com permissão 0600. O valor nunca é exibido pela API.</p>
+      </section>
       <form id="importForm">
         <label class="upload-zone" for="backupFile">
           <span class="upload-icon">⇧</span>
-          <strong>Escolha o arquivo do backup</strong>
-          <span>SQLite, ZIP, TAR ou TAR.GZ com até o limite configurado</span>
-          <input id="backupFile" name="file" type="file" accept=".db,.sqlite,.zip,.tar,.gz,.tgz" required />
+          <strong>Escolha uma conversa ou backup</strong>
+          <span>CRYPT15, TXT/ZIP exportado, SQLite, ZIP, TAR ou TAR.GZ</span>
+          <input id="backupFile" name="file" type="file" accept=".txt,.db,.sqlite,.zip,.tar,.gz,.tgz,.crypt12,.crypt14,.crypt15" />
+        </label>
+        <div class="import-separator"><span>ou</span></div>
+        <label class="directory-button" for="directoryFiles">
+          Selecionar a pasta WhatsApp
+          <input id="directoryFiles" type="file" webkitdirectory directory multiple />
         </label>
         <p class="selected-file" id="selectedFile">Nenhum arquivo selecionado</p>
+        <div class="import-options">
+          <label>
+            <span>Seu nome na conversa (opcional)</span>
+            <input id="ownerName" name="owner_name" maxlength="200" placeholder="Exatamente como aparece no TXT" />
+          </label>
+          <label>
+            <span>Ordem das datas do TXT</span>
+            <select id="dateOrder" name="date_order">
+              <option value="auto">Automática (dia/mês como padrão)</option>
+              <option value="dmy">Dia/mês/ano</option>
+              <option value="mdy">Mês/dia/ano</option>
+            </select>
+          </label>
+        </div>
+        <p class="format-note">Arquivos <code>.crypt15</code> usam automaticamente a chave salva. O banco aberto existe apenas durante a importação.</p>
         <div class="local-warning">Sem autenticação: use esta função somente em sua rede local confiável.</div>
         <button class="primary-button" id="importSubmit" type="submit">Enviar e importar</button>
       </form>
