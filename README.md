@@ -43,6 +43,8 @@ usar a chave salva para importar um backup, embora a API nunca revele seu valor.
 - migrações de banco com Alembic executadas automaticamente;
 - backup portátil com checksums SHA-256 e cifragem AES-256-GCM opcional;
 - backup periódico cifrado, verificação automática e retenção configurável;
+- cabeçalhos de segurança com CSP estrito, já que a aplicação não tem login;
+- importações em fila, uma de cada vez, com limpeza do spool no arranque;
 - núcleo próprio sob licença MIT; compatibilidade `.crypt*` isolada em componente
   GPL-3.0-or-later, documentado ao fim deste arquivo.
 
@@ -68,9 +70,11 @@ WLAV_PORT=21001
 Em Linux, ajuste `WLAV_UID` e `WLAV_GID` com os resultados de `id -u` e `id -g`.
 Isso faz backups criados em `exports/` pertencerem ao usuário correto.
 
-Na inicialização, `docker/init.sql` prepara o primeiro banco e o contêiner `app`
-executa `alembic upgrade head`. Nas atualizações futuras, as migrações preservam
-os dados já importados.
+Na inicialização, `docker/init.sql` instala apenas a extensão `pg_trgm` e o
+contêiner `app` executa `alembic upgrade head`. A migração do Alembic é a **única
+fonte de verdade** do schema: manter o DDL duplicado em `init.sql` fazia o banco
+divergir da migração em silêncio. Nas atualizações futuras, as migrações
+preservam os dados já importados.
 
 ### Usar a imagem pronta do GHCR
 
@@ -161,6 +165,19 @@ envia os arquivos mantendo os caminhos relativos e o WLAV procura bancos,
 exportações textuais e mídias. Esse modo é útil para organizar a entrada, mas não
 remove a criptografia do WhatsApp.
 
+Uma pasta real costuma ter dezenas de milhares de arquivos, e o limite padrão de
+1.000 do parser multipart do Starlette tornaria esse fluxo impossível. Por isso o
+endpoint lê o formulário com `IMPORT_MAX_FILES`, cujo padrão é 200.000 arquivos.
+Reduza esse valor se preferir um teto mais rígido:
+
+```env
+IMPORT_MAX_FILES=20000
+```
+
+Cada importação é executada por vez, na ordem em que foi enfileirada. Duas
+importações simultâneas duplicariam CPU, memória e I/O de disco sem ganho, já que
+o UPSERT torna reimportar seguro.
+
 Se a pasta contiver um `msgstore*.db.crypt15`, a chave salva será utilizada
 automaticamente. O WLAV não extrai chaves do aplicativo, não contorna permissões
 do Android e não envia dados a serviços externos.
@@ -187,7 +204,10 @@ Depois, basta abrir novamente e enviar outro backup.
 
 O limite padrão do upload é 100 GB e pode ser alterado com `UPLOAD_MAX_GB`. O
 arquivo recebido é apagado do spool ao terminar; apenas dados normalizados e
-mídias organizadas permanecem.
+mídias organizadas permanecem. No arranque, o contêiner descarta os diretórios de
+spool que não correspondem a uma importação enfileirada ou em andamento: um
+processo morto no meio de um envio deixaria o diretório ocupando o volume para
+sempre.
 
 ### Como múltiplos backups são combinados
 
@@ -235,6 +255,14 @@ de `.thumbs/`. Para gerar previews de mídias importadas por versões anteriores
 docker compose run --rm ingestor thumbnails
 ```
 
+O comando distingue o que foi gerado, o que não se aplica (a mídia sumiu do
+volume) e o que **falhou**, e sai com código diferente de zero se houve falhas.
+Antes, uma `PermissionError` ao gravar dentro de um diretório criado pela
+aplicação era contada como "ignorado" e passava despercebida. Os diretórios e
+arquivos de mídia são criados com permissão de escrita para qualquer uid
+(`0777`/`0666`), porque o volume é compartilhado entre a aplicação (uid 10001) e
+as ferramentas de linha de comando (`WLAV_UID`).
+
 ## 4. Backup manual, cifragem e integridade
 
 Crie uma senha forte em arquivo ignorado pelo Git:
@@ -280,6 +308,23 @@ WLAV valida a autenticação criptográfica, caminhos do arquivo e SHA-256 de ca
 JSONL, mídia e thumbnail. A senha não é armazenada no banco nem no backup.
 
 Para exportar sem cifragem, omita `--encrypt` e use a extensão `.tar.gz`.
+
+### Formato do backup portátil
+
+O formato atual é a **versão 3**, que grava `manifest.json` e `checksums.json` no
+*início* do tar. Nas versões 1 e 2 esses dois arquivos ficavam no fim, e como o
+gzip não permite saltos baratos, `verify` precisava de duas varreduras e `restore`
+de quatro. Mover os metadados para o começo reduziu a restauração para duas
+varreduras sem abrir mão da garantia: nada é gravado no banco nem no volume antes
+de o arquivo inteiro passar pelos checksums.
+
+Backups v1 e v2 continuam legíveis. A v1 nunca gravou hashes, e por isso não é
+possível garantir a integridade do conteúdo dela — a verificação se limita a
+confirmar que o tar é legível.
+
+Um arquivo com um membro a mais, a menos, renomeado ou adulterado é recusado
+antes de qualquer escrita, tanto por incompatibilidade com `checksums.json`
+quanto por nome de caminho inseguro.
 
 ## 5. Backup automático e retenção
 
@@ -351,6 +396,7 @@ services:
       WHATSAPP_KEY_PATH: /var/lib/wlav/secrets/whatsapp.key
       TMPDIR: /var/wlav_imports
       UPLOAD_MAX_GB: ${UPLOAD_MAX_GB:-100}
+      IMPORT_MAX_FILES: ${IMPORT_MAX_FILES:-200000}
       THUMBNAIL_MAX_SIZE: ${THUMBNAIL_MAX_SIZE:-480}
       TZ: America/Sao_Paulo
     ports:
@@ -416,6 +462,9 @@ WLAV_IMAGE=ghcr.io/facrf/wlav:latest
 Se a senha contiver `@`, `:`, `/`, `?` ou `#`, aplique percent-encoding somente
 na parte da senha em `DATABASE_URL`.
 
+`IMPORT_MAX_FILES` e `IMPORT_MAX_FIELDS` só precisam ser declarados se você quiser
+um teto diferente do padrão do código.
+
 ## API
 
 | Rota | Uso |
@@ -433,7 +482,39 @@ na parte da senha em `DATABASE_URL`.
 | `DELETE /api/settings/whatsapp-key` | Remove a chave salva |
 | `GET /media/{caminho}` | Mídia local com suporte a `Range` |
 
+`POST /api/imports` responde:
+
+| Código | Quando |
+|---|---|
+| `202` | Upload recebido; a importação começa na fila |
+| `400` | multipart malformado, nome de arquivo inseguro ou caminho duplicado |
+| `413` | corpo acima de `UPLOAD_MAX_GB` |
+| `422` | nenhum arquivo enviado, ou `date_order` inválido |
+
+O corpo é lido manualmente para poder elevar o limite de arquivos do multipart, o
+que significa que o FastAPI não o infere da assinatura da rota. O esquema
+`requestBody` está declarado explicitamente para o `/api/docs` continuar correto.
+
 Documentação interativa: `http://localhost:21001/api/docs`.
+
+## Cabeçalhos de segurança
+
+Todas as respostas, exceto o `/api/docs` e o `/api/openapi.json`, recebem:
+
+```text
+Content-Security-Policy: default-src 'self'; base-uri 'none'; object-src 'none';
+  frame-ancestors 'none'; form-action 'self'; script-src 'self'; style-src 'self';
+  img-src 'self' data: blob:; media-src 'self' blob:; font-src 'self'; connect-src 'self'
+X-Content-Type-Options: nosniff
+X-Frame-Options: DENY
+Referrer-Policy: no-referrer
+Permissions-Policy: geolocation=(), microphone=(), camera=()
+```
+
+Como a aplicação não tem autenticação, um XSS daria acesso total ao arquivo
+histórico. O front-end não usa estilo nem script inline, o que permite um CSP
+estrito, sem `unsafe-inline`. O Swagger UI é a exceção: ele é servido de um CDN e
+precisa de script inline.
 
 ## Atualizações e migrações
 
@@ -451,6 +532,21 @@ manualmente:
 docker compose exec app alembic current
 docker compose exec app alembic upgrade head
 ```
+
+Para apontar as migrações a outro banco sem alterar o ambiente do processo:
+
+```bash
+docker compose exec app alembic -x database_url=postgresql+psycopg://... upgrade head
+```
+
+A revisão `20260929_0002` acrescenta o índice `ix_chats_last_message_time`, usado
+pela ordenação de `GET /api/chats`. Sem ele, cada página paginada pagava um sort
+completo da tabela de conversas.
+
+Os índices também estão declarados no metadata dos models, e `tests/test_schema.py`
+compara o schema criado pelas migrações com o que os models declaram. É o que
+impede um índice de ser removido dos models sem ninguém perceber, já que o
+`create_all()` deixaria de criá-lo e o banco continuaria funcionando.
 
 Nunca execute downgrade sem um backup íntegro recente.
 
@@ -508,6 +604,30 @@ pytest
 alembic upgrade head
 uvicorn backend.app.main:app --reload --port 21001
 ```
+
+### Testes
+
+`pytest` sozinho roda a suíte que não precisa de banco. Com
+`WLAV_TEST_DATABASE_URL` apontando para um PostgreSQL descartável, os testes
+restantes também são executados; sem a variável eles são pulados, e não falham.
+
+```bash
+docker run -d --name wlav-testdb -e POSTGRES_PASSWORD=postgres -p 55432:5432 \
+  postgres:16-alpine
+
+WLAV_TEST_DATABASE_URL='postgresql+psycopg://postgres:postgres@127.0.0.1:55432/wlav_test' \
+  pytest
+```
+
+A fixture cria o banco se ele não existir, recria o schema `public` e aplica as
+migrações do Alembic de verdade, e não `create_all`. É por isso que o schema
+resultante é comparável com o que os models declaram.
+
+Com o banco disponível, a suíte cobre o que antes só tinha dublês de sessão: a
+paginação por cursor, a janela `around`, a busca FTS e a ordenação de conversas,
+além da exportação, verificação e restauração do backup portátil, que não tinham
+nenhum teste. No CI o serviço `db` do workflow faz esse papel, então a publicação
+da imagem só acontece com a suíte completa verde.
 
 ## Estrutura
 

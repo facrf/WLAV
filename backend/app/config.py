@@ -24,6 +24,11 @@ class Settings(BaseSettings):
     upload_max_gb: int = Field(default=100, ge=1, le=2_000)
     thumbnail_max_size: int = Field(default=480, ge=160, le=1_920)
     whatsapp_export_timezone: str = "America/Sao_Paulo"
+    # O Starlette recusa o multipart acima de 1000 arquivos por padrão, o que
+    # quebra o envio de uma pasta Media/ real. Estes limites são altos de
+    # propósito; o corpo do upload já é limitado por upload_max_gb.
+    import_max_files: int = Field(default=200_000, ge=1, le=5_000_000)
+    import_max_fields: int = Field(default=32, ge=1, le=1_000)
 
 
 @lru_cache

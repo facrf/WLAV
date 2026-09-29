@@ -1,9 +1,24 @@
 from datetime import datetime
 
-from sqlalchemy import BigInteger, Boolean, DateTime, ForeignKey, Index, String, Text, func
+from sqlalchemy import (
+    BigInteger,
+    Boolean,
+    DateTime,
+    ForeignKey,
+    Index,
+    String,
+    Text,
+    func,
+    literal_column,
+)
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .database import Base
+
+# Configuração de busca full-text e de similaridade. Declaradas no metadata para
+# que `Base.metadata.create_all()` reproduza exatamente o mesmo schema que as
+# migrações do Alembic criam; `tests/test_schema.py` compara as duas fontes.
+FTS_LANGUAGE = literal_column("'portuguese'::regconfig")
 
 
 class Chat(Base):
@@ -19,6 +34,20 @@ class Chat(Base):
 
     messages: Mapped[list["Message"]] = relationship(
         back_populates="chat", cascade="all, delete-orphan"
+    )
+
+    __table_args__ = (
+        # Índice sobre a coluna pura (e não sobre coalesce) para que o planner
+        # associe `name ILIKE '%termo%'` a este índice.
+        Index(
+            "ix_chats_name_trgm",
+            name,
+            postgresql_using="gin",
+            postgresql_ops={"name": "gin_trgm_ops"},
+        ),
+        # /api/chats pagina por last_message_time; sem este índice cada página
+        # paga um sort completo da tabela de conversas.
+        Index("ix_chats_last_message_time", last_message_time.desc().nullslast(), name),
     )
 
 
@@ -50,6 +79,20 @@ class Message(Base):
     )
 
     chat: Mapped[Chat] = relationship(back_populates="messages")
+
+
+# Declarado fora do corpo da classe porque a expressão referencia `Message`, e
+# anexado explicitamente para que `create_all()` o crie junto com a tabela.
+# Materializa o tsvector para que a busca use o índice GIN em vez de recalcular
+# to_tsvector() linha a linha. `tests/test_schema.py` falha se este índice for
+# removido do metadata.
+Message.__table__.append_constraint(
+    Index(
+        "ix_messages_content_fts_portuguese",
+        func.to_tsvector(FTS_LANGUAGE, func.coalesce(Message.content, "")),
+        postgresql_using="gin",
+    )
+)
 
 
 class ImportJob(Base):

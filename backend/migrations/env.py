@@ -8,20 +8,17 @@ from backend.app.config import get_settings
 from backend.app.database import Base
 
 config = context.config
-config.set_main_option("sqlalchemy.url", get_settings().database_url)
+# `alembic -x database_url=...` sobrepõe a URL; sem ele vale a configuração da
+# aplicação. Isso permite aplicar as migrações em um banco descartável de teste
+# sem alterar o ambiente do processo.
+config.set_main_option(
+    "sqlalchemy.url",
+    context.get_x_argument(as_dictionary=True).get("database_url") or get_settings().database_url,
+)
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
 target_metadata = Base.metadata
-MANAGED_EXPRESSION_INDEXES = {
-    "ix_messages_content_fts_portuguese",
-    "ix_chats_name_trgm",
-}
-
-
-def include_object(object_, name, type_, reflected, compare_to):
-    del object_, reflected, compare_to
-    return not (type_ == "index" and name in MANAGED_EXPRESSION_INDEXES)
 
 
 def run_migrations_offline() -> None:
@@ -31,7 +28,6 @@ def run_migrations_offline() -> None:
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
         compare_type=True,
-        include_object=include_object,
     )
     with context.begin_transaction():
         context.run_migrations()
@@ -48,7 +44,6 @@ def run_migrations_online() -> None:
             connection=connection,
             target_metadata=target_metadata,
             compare_type=True,
-            include_object=include_object,
         )
         with context.begin_transaction():
             context.run_migrations()

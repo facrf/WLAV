@@ -356,10 +356,9 @@ function rebuildMessages(messages) {
 
 function appendMessages(messages, prepend) {
   const fragment = document.createDocumentFragment();
+  // Ao prepender, o primeiro lote sempre cria um separador; duplicados com o
+  // lote já presente são removidos por deduplicateDateSeparators().
   let previousDate = null;
-  if (prepend && elements.messageList.firstElementChild?.dataset.date) {
-    previousDate = null;
-  }
   for (const message of messages) {
     if (state.loadedMessageIds.has(message.id)) continue;
     const dateKey = new Date(message.timestamp).toLocaleDateString("en-CA");

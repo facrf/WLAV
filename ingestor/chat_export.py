@@ -271,7 +271,11 @@ class WhatsAppExportReader:
 
     def iter_messages(self, batch_size: int = 1_000) -> Iterator[MessageRecord]:
         del batch_size
-        seen: set[str] = set()
+        # Guarda um prefixo de 16 bytes do digest em vez do id completo: em uma
+        # exportação de milhões de linhas, um set de strings de 71 caracteres
+        # custaria centenas de MB. O prefixo continua sendo único na prática e o
+        # id gravado no banco permanece o digest inteiro.
+        seen: set[bytes] = set()
         for metadata in self._metadata:
             occurrences: Counter[str] = Counter()
             for timestamp, sender, raw_content in _iter_raw_entries(
@@ -290,11 +294,12 @@ class WhatsAppExportReader:
                 )
                 occurrence = occurrences[signature]
                 occurrences[signature] += 1
-                digest = hashlib.sha256(f"{signature}\x1f{occurrence}".encode()).hexdigest()
-                message_id = f"export-{digest[:64]}"
-                if message_id in seen:
+                raw_digest = hashlib.sha256(f"{signature}\x1f{occurrence}".encode()).digest()
+                message_id = f"export-{raw_digest.hex()}"
+                fingerprint = raw_digest[:16]
+                if fingerprint in seen:
                     continue
-                seen.add(message_id)
+                seen.add(fingerprint)
                 yield MessageRecord(
                     id=message_id,
                     chat_jid=metadata.chat_jid,

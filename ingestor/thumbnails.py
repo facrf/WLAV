@@ -8,6 +8,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from backend.app.models import Message
+from ingestor.media_store import ensure_shared_dir, share_path
 
 logger = logging.getLogger("wlav.thumbnails")
 
@@ -38,16 +39,20 @@ class Thumbnailer:
             and destination.stat().st_mtime >= source.stat().st_mtime
         ):
             return relative
-        destination.parent.mkdir(parents=True, exist_ok=True)
+        ensure_shared_dir(destination.parent)
         partial = destination.with_name(destination.name + ".part.jpg")
         try:
             if media_type in {"image", "sticker"}:
                 self._image(source, partial)
             else:
                 self._video(source, partial)
+            share_path(partial)
             partial.replace(destination)
             return relative
         except (OSError, subprocess.SubprocessError, UnidentifiedImageError) as exc:
+            # PermissionError aqui quase sempre significa que a pasta .thumbs foi
+            # criada pela aplicação com outro uid; o comando `thumbnails` contava
+            # isso como "ignorado" e a falha passava despercebida.
             logger.warning("Não foi possível gerar thumbnail de %s: %s", media_path, exc)
             partial.unlink(missing_ok=True)
             return None
@@ -88,7 +93,8 @@ class Thumbnailer:
 
 
 def rebuild_thumbnails(session: Session, thumbnailer: Thumbnailer) -> dict[str, int]:
-    stats = {"generated": 0, "skipped": 0}
+    """Regera previews ausentes, distinguindo o que falhou do que não se aplica."""
+    stats = {"generated": 0, "skipped": 0, "failed": 0}
     messages = session.execute(
         select(Message.media_path, Message.media_type).where(
             Message.media_path.is_not(None),
@@ -96,8 +102,31 @@ def rebuild_thumbnails(session: Session, thumbnailer: Thumbnailer) -> dict[str, 
         )
     ).yield_per(500)
     for media_path, media_type in messages:
-        if media_path and thumbnailer.generate(media_path, media_type):
+        if not media_path:
+            continue
+        try:
+            resolved = (thumbnailer.media_root / media_path).resolve()
+        except OSError:
+            stats["failed"] += 1
+            continue
+        if not resolved.is_relative_to(thumbnailer.media_root) or not resolved.is_file():
+            # A mídia sumiu do volume; não há preview a produzir.
+            stats["skipped"] += 1
+            continue
+        try:
+            ensure_shared_dir((thumbnailer.media_root / thumbnail_relative(media_path)).parent)
+        except OSError as exc:
+            logger.error("Sem permissão para gravar thumbnails de %s: %s", media_path, exc)
+            stats["failed"] += 1
+            continue
+        if thumbnailer.generate(media_path, media_type):
             stats["generated"] += 1
         else:
-            stats["skipped"] += 1
+            stats["failed"] += 1
+    if stats["failed"]:
+        logger.error(
+            "%d thumbnail(s) não puderam ser gravados; verifique as permissões de %s",
+            stats["failed"],
+            thumbnailer.media_root,
+        )
     return stats

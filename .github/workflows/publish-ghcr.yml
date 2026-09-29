@@ -29,6 +29,26 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
 
+    # Os testes que dependem do banco rodam contra um PostgreSQL descartável.
+    # Sem `WLAV_TEST_DATABASE_URL` eles são pulados, e o schema, a paginação por
+    # cursor, a busca FTS e o backup portátil ficariam sem cobertura.
+    services:
+      db:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+
+    env:
+      WLAV_TEST_DATABASE_URL: postgresql+psycopg://postgres:postgres@127.0.0.1:5432/wlav_test
+
     steps:
       - name: Baixar o código
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -45,7 +65,7 @@ jobs:
       - name: Validar o projeto
         run: |
           ruff check .
-          pytest
+          pytest -q
 
       - name: Preparar emulação multi-arquitetura
         uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3

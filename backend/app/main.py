@@ -16,17 +16,16 @@ from fastapi import (
     BackgroundTasks,
     Depends,
     FastAPI,
-    File,
-    Form,
     HTTPException,
     Query,
     Request,
-    UploadFile,
 )
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import and_, func, literal_column, or_, select, text
 from sqlalchemy.orm import Session
+from starlette.datastructures import UploadFile
+from starlette.formparsers import MultiPartException
 
 from ingestor.key_store import WhatsAppKeyStore
 from ingestor.thumbnails import thumbnail_relative
@@ -57,6 +56,30 @@ logger = logging.getLogger("wlav")
 running_imports: set[asyncio.Task] = set()
 whatsapp_key_store = WhatsAppKeyStore(settings.whatsapp_key_path)
 
+UPLOAD_CHUNK_SIZE = 4 * 1024 * 1024
+IMPORT_STATUS_OPEN = ("queued", "running")
+
+# A aplicação não tem autenticação (decisão de projeto documentada no README),
+# então qualquer XSS daria acesso total ao arquivo. O front-end não usa estilo nem
+# script inline, o que permite um CSP estrito sem `unsafe-inline`.
+SECURITY_HEADERS = {
+    "Content-Security-Policy": (
+        "default-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; "
+        "form-action 'self'; script-src 'self'; style-src 'self'; "
+        "img-src 'self' data: blob:; media-src 'self' blob:; font-src 'self'; connect-src 'self'"
+    ),
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "Referrer-Policy": "no-referrer",
+    "Permissions-Policy": "geolocation=(), microphone=(), camera=()",
+}
+# O Swagger UI é servido de um CDN e usa script inline; um CSP estrito o quebraria.
+_UNRESTRICTED_PATHS = ("/api/docs", "/api/openapi.json")
+
+# Importações rodam uma de cada vez. Duas em paralelo duplicariam CPU, memória e
+# I/O sem nenhum ganho, porque o UPSERT já torna reimportar seguro.
+import_semaphore = asyncio.Semaphore(1)
+
 
 def _import_source(job_id: str) -> Path:
     directory = settings.import_root / job_id
@@ -64,25 +87,40 @@ def _import_source(job_id: str) -> Path:
     return uploaded_file if uploaded_file.is_file() else directory / "source.directory"
 
 
-def _resume_interrupted_imports() -> None:
+async def _import_worker(job_id: str, upload_path: Path) -> None:
+    async with import_semaphore:
+        await asyncio.to_thread(run_import_job, job_id, upload_path)
+
+
+def _recover_imports() -> list[str]:
+    """Retoma importações interrompidas e descarta spools que não servem mais.
+
+    Duas situações deixam lixo no volume. A primeira é o ImportJob gravado só
+    depois de o upload terminar: um contêiner morto no meio do envio deixa
+    diretório sem linha no banco. A segunda é o oposto — o job commitado e o
+    processo morto antes do `rmtree` final. Nos dois casos o diretório ocupa
+    espaço para sempre, já que uma importação pode chegar a 100 GB.
+    """
     with SessionLocal() as session:
-        jobs = list(
-            session.scalars(select(ImportJob).where(ImportJob.status.in_(("queued", "running"))))
-        )
+        jobs = list(session.scalars(select(ImportJob)))
+        keep: set[str] = set()
+        resumable: list[str] = []
         for job in jobs:
-            upload_path = _import_source(job.id)
-            if not upload_path.exists():
+            if job.status not in IMPORT_STATUS_OPEN:
+                continue  # spool obsoleto; a limpeza abaixo apaga
+            if _import_source(job.id).exists():
+                keep.add(job.id)
+                resumable.append(job.id)
+            else:
                 job.status = "failed"
                 job.error = "Arquivo temporário ausente após reinicialização"
                 job.completed_at = datetime.now(UTC)
         session.commit()
-    for job in jobs:
-        upload_path = _import_source(job.id)
-        if not upload_path.exists():
-            continue
-        task = asyncio.create_task(asyncio.to_thread(run_import_job, job.id, upload_path))
-        running_imports.add(task)
-        task.add_done_callback(running_imports.discard)
+    for entry in settings.import_root.iterdir():
+        if entry.is_dir() and entry.name not in keep:
+            logger.info("Descartando spool de importação sem uso: %s", entry.name)
+            shutil.rmtree(entry, ignore_errors=True)
+    return resumable
 
 
 @asynccontextmanager
@@ -93,7 +131,10 @@ async def lifespan(_: FastAPI):
     settings.whatsapp_key_path.parent.chmod(0o700)
     with engine.connect() as connection:
         connection.execute(text("SELECT 1"))
-    _resume_interrupted_imports()
+    for job_id in _recover_imports():
+        task = asyncio.create_task(_import_worker(job_id, _import_source(job_id)))
+        running_imports.add(task)
+        task.add_done_callback(running_imports.discard)
     logger.info("WLAV iniciado; mídias em %s", settings.media_root)
     yield
 
@@ -106,6 +147,16 @@ app = FastAPI(
     lifespan=lifespan,
 )
 SessionDep = Annotated[Session, Depends(get_session)]
+
+
+@app.middleware("http")
+async def security_headers(request: Request, call_next):
+    response = await call_next(request)
+    if not request.url.path.startswith(_UNRESTRICTED_PATHS):
+        for header, value in SECURITY_HEADERS.items():
+            response.headers.setdefault(header, value)
+    return response
+
 
 
 def _encode_cursor(message: Message) -> str:
@@ -126,17 +177,29 @@ def _decode_cursor(cursor: str) -> tuple[datetime, str]:
 
 def _message_out(message: Message, quotes: dict[str, Message] | None = None) -> MessageOut:
     quoted = quotes.get(message.quoted_message_id) if quotes and message.quoted_message_id else None
-    quote_out = None
-    if quoted:
-        quote_out = QuoteOut(
-            id=quoted.id,
-            sender_name=quoted.sender_name,
-            content=quoted.content,
-            media_type=quoted.media_type,
-        )
     return MessageOut(
-        **{column.name: getattr(message, column.name) for column in Message.__table__.columns},
-        quoted_message=quote_out,
+        id=message.id,
+        chat_jid=message.chat_jid,
+        sender_jid=message.sender_jid,
+        sender_name=message.sender_name,
+        content=message.content,
+        timestamp=message.timestamp,
+        from_me=message.from_me,
+        has_media=message.has_media,
+        media_type=message.media_type,
+        media_path=message.media_path,
+        media_mime=message.media_mime,
+        quoted_message_id=message.quoted_message_id,
+        quoted_message=(
+            QuoteOut(
+                id=quoted.id,
+                sender_name=quoted.sender_name,
+                content=quoted.content,
+                media_type=quoted.media_type,
+            )
+            if quoted
+            else None
+        ),
         media_url=f"/media/{quote(message.media_path, safe='/')}" if message.media_path else None,
         thumbnail_url=(
             f"/media/{quote(thumbnail_relative(message.media_path), safe='/')}"
@@ -364,86 +427,159 @@ def get_import(job_id: str, session: SessionDep) -> ImportJob:
     return job
 
 
-@app.post("/api/imports", response_model=ImportJobOut, status_code=202)
-async def create_import(
-    background_tasks: BackgroundTasks,
-    session: SessionDep,
-    file: Annotated[
-        list[UploadFile],
-        File(description="TXT/ZIP exportado, SQLite, pacote ou arquivos de uma pasta"),
-    ],
-    owner_name: Annotated[str | None, Form(max_length=200)] = None,
-    date_order: Annotated[str, Form()] = "auto",
-) -> ImportJob:
-    if not file:
-        raise HTTPException(status_code=422, detail="Selecione ao menos um arquivo")
-    if date_order not in {"auto", "dmy", "mdy"}:
-        raise HTTPException(status_code=422, detail="Ordem de data inválida")
-    job_id = str(uuid4())
-    job_directory = settings.import_root / job_id
-    job_directory.mkdir(parents=True, exist_ok=False)
-    maximum = settings.upload_max_gb * 1024**3
-    size = 0
-    digest = hashlib.sha256()
+async def _receive_upload(
+    job_directory: Path, files: list[UploadFile]
+) -> tuple[Path, str, str]:
+    """Grava os arquivos enviados e devolve (origem, nome exibido, SHA-256).
+
+    Erros de nome de arquivo são culpa do cliente (4xx); erros de escrita são do
+    servidor (5xx). Sem essa distinção, um `../` no nome encerrava a importação
+    com um 500 opaco e o usuário não tinha como saber o que corrigir.
+    """
     try:
         relative_names = [
             safe_relative_path(item.filename or f"arquivo-{index}")
-            for index, item in enumerate(file)
+            for index, item in enumerate(files)
         ]
-        is_directory = len(file) > 1 or any(len(path.parts) > 1 for path in relative_names)
-        upload_path = job_directory / ("source.directory" if is_directory else "source.upload")
-        if is_directory:
-            upload_path.mkdir()
-        targets: set[Path] = set()
-        for item, relative in zip(file, relative_names, strict=True):
-            target = upload_path / relative if is_directory else upload_path
-            resolved = target.resolve()
-            root = upload_path.resolve() if is_directory else job_directory.resolve()
-            if not resolved.is_relative_to(root) or resolved in targets:
-                raise HTTPException(status_code=400, detail="Caminho duplicado ou inseguro")
-            targets.add(resolved)
-            target.parent.mkdir(parents=True, exist_ok=True)
-            digest.update(relative.as_posix().encode())
-            with target.open("wb") as handle:
-                while chunk := await item.read(4 * 1024 * 1024):
-                    size += len(chunk)
-                    if size > maximum:
-                        raise HTTPException(
-                            status_code=413,
-                            detail=f"Upload excede o limite de {settings.upload_max_gb} GB",
-                        )
-                    digest.update(chunk)
-                    handle.write(chunk)
-        (job_directory / "options.json").write_text(
-            json.dumps(
-                {"owner_name": (owner_name or "").strip(), "date_order": date_order},
-                ensure_ascii=False,
-            ),
-            encoding="utf-8",
-        )
-    except Exception:
-        shutil.rmtree(job_directory, ignore_errors=True)
-        raise
-    finally:
-        for item in file:
-            await item.close()
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    is_directory = len(files) > 1 or any(len(path.parts) > 1 for path in relative_names)
+    upload_path = job_directory / ("source.directory" if is_directory else "source.upload")
     if is_directory:
-        first_root = relative_names[0].parts[0]
-        display_name = f"{first_root}/ ({len(file)} arquivos)"
-    else:
-        display_name = file[0].filename or "backup"
+        upload_path.mkdir()
+    maximum = settings.upload_max_gb * 1024**3
+    size = 0
+    digest = hashlib.sha256()
+    root = upload_path.resolve() if is_directory else job_directory.resolve()
+    targets: set[Path] = set()
+    for item, relative in zip(files, relative_names, strict=True):
+        target = upload_path / relative if is_directory else upload_path
+        resolved = target.resolve()
+        if not resolved.is_relative_to(root) or resolved in targets:
+            raise HTTPException(status_code=400, detail="Caminho duplicado ou inseguro")
+        targets.add(resolved)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        digest.update(relative.as_posix().encode())
+        with target.open("wb") as handle:
+            while chunk := await item.read(UPLOAD_CHUNK_SIZE):
+                size += len(chunk)
+                if size > maximum:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"Upload excede o limite de {settings.upload_max_gb} GB",
+                    )
+                digest.update(chunk)
+                handle.write(chunk)
+    display_name = (
+        f"{relative_names[0].parts[0]}/ ({len(files)} arquivos)"
+        if is_directory
+        else (files[0].filename or "backup")
+    )
+    return upload_path, display_name, digest.hexdigest()
+
+
+@app.post(
+    "/api/imports",
+    response_model=ImportJobOut,
+    status_code=202,
+    # O corpo é lido manualmente para poder elevar o limite de arquivos do
+    # multipart (o padrão do Starlette é 1000 e quebra o envio de uma pasta
+    # Media/ real). O esquema abaixo mantém a documentação OpenAPI correta.
+    openapi_extra={
+        "requestBody": {
+            "required": True,
+            "content": {
+                "multipart/form-data": {
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "file": {
+                                "type": "array",
+                                "items": {"type": "string", "format": "binary"},
+                                "description": (
+                                    "TXT/ZIP exportado, SQLite, pacote ou os arquivos "
+                                    "de uma pasta copiada do telefone"
+                                ),
+                            },
+                            "owner_name": {
+                                "type": "string",
+                                "maxLength": 200,
+                                "description": "Seu nome exatamente como aparece no TXT",
+                            },
+                            "date_order": {
+                                "type": "string",
+                                "enum": ["auto", "dmy", "mdy"],
+                                "default": "auto",
+                                "description": "Ordem das datas na exportação TXT",
+                            },
+                        },
+                        "required": ["file"],
+                    }
+                }
+            },
+        }
+    },
+)
+async def create_import(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    session: SessionDep,
+) -> ImportJob:
+    try:
+        form = await request.form(
+            max_files=settings.import_max_files, max_fields=settings.import_max_fields
+        )
+    except MultiPartException as exc:
+        raise HTTPException(status_code=400, detail=f"Upload inválido: {exc}") from exc
+
+    try:
+        files = [item for item in form.getlist("file") if isinstance(item, UploadFile)]
+        if not files:
+            raise HTTPException(status_code=422, detail="Selecione ao menos um arquivo")
+        date_order = form.get("date_order") or "auto"
+        if date_order not in {"auto", "dmy", "mdy"}:
+            raise HTTPException(status_code=422, detail="Ordem de data inválida")
+
+        job_id = str(uuid4())
+        job_directory = settings.import_root / job_id
+        job_directory.mkdir(parents=True, exist_ok=False)
+        try:
+            upload_path, display_name, source_digest = await _receive_upload(job_directory, files)
+            (job_directory / "options.json").write_text(
+                json.dumps(
+                    {
+                        "owner_name": (form.get("owner_name") or "").strip()[:200],
+                        "date_order": date_order,
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+        except HTTPException:
+            shutil.rmtree(job_directory, ignore_errors=True)
+            raise
+        except (OSError, ValueError, MemoryError) as exc:
+            shutil.rmtree(job_directory, ignore_errors=True)
+            logger.exception("Falha ao gravar o upload %s", job_id)
+            raise HTTPException(
+                status_code=500, detail="Não foi possível gravar o arquivo enviado"
+            ) from exc
+    finally:
+        # Fecha também os arquivos temporários do parser multipart, que sozinhos
+        # ocupariam o volume do spool durante toda a importação.
+        await form.close()
 
     job = ImportJob(
         id=job_id,
         filename=display_name[:500],
-        source_sha256=digest.hexdigest(),
+        source_sha256=source_digest,
         status="queued",
     )
     session.add(job)
     session.commit()
     session.refresh(job)
-    background_tasks.add_task(run_import_job, job_id, upload_path)
+    background_tasks.add_task(_import_worker, job_id, upload_path)
     return job
 
 

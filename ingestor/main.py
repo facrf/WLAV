@@ -121,8 +121,11 @@ def run_thumbnails(args: argparse.Namespace) -> int:
     thumbnailer = Thumbnailer(Path(args.media_root), args.thumbnail_size)
     with Session(_engine(args)) as session:
         stats = rebuild_thumbnails(session, thumbnailer)
-    print(f"THUMBNAILS: {stats['generated']} gerados/reutilizados; {stats['skipped']} ignorados.")
-    return 0
+    print(
+        f"THUMBNAILS: {stats['generated']} gerados/reutilizados; "
+        f"{stats['skipped']} sem mídia no volume; {stats['failed']} com falha."
+    )
+    return 1 if stats["failed"] else 0
 
 
 def run_backup_loop(args: argparse.Namespace) -> int:

@@ -6,6 +6,10 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
+# As raízes de volume são criadas pelo Docker, então o Python não pode ajustá-las.
+# Os subdiretórios e arquivos dentro do volume são gravados com 0777/0666 por
+# ingestor/media_store.py, para que as CLIs (uid WLAV_UID) também possam escrever.
+# O chmod abaixo é o que torna a raiz atravessável por qualquer uid.
 RUN groupadd --system --gid 10001 wlav \
     && useradd --system --uid 10001 --gid wlav --home-dir /app wlav \
     && mkdir -p /var/whatsapp_media /var/wlav_imports /var/lib/wlav/secrets /imports /exports \
